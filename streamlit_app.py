@@ -1,0 +1,9 @@
+streamlit
+geopandas
+gspread
+shapely
+folium
+streamlit_folium
+sqlalchemy
+psycopg2-binary
+geopy
