@@ -56,11 +56,18 @@ class BackgroundCode:
         except gspread.WorksheetNotFound:
             st.warning(f"Worksheet '{sheet_name}' not found.")
             return pd.DataFrame()
-        
-    def get_sheet_dataframe(self, sheet_name, sheet):
-        """Read a worksheet into a DataFrame."""
+
+    @st.cache_data(ttl=2_592_000, show_spinner="Sheet laden...")
+    def get_sheet_dataframe(_self, sheet_name, _sheet):
+        """Read a worksheet into a DataFrame.
+
+        Cached for 30 days. _self and _sheet are prefixed with an underscore
+        so Streamlit skips them when computing the cache key — the cache is
+        keyed only on sheet_name. Clear via st.cache_data.clear() or the
+        'Data Verversen' button.
+        """
         try:
-            worksheet = sheet.worksheet(sheet_name)
+            worksheet = _sheet.worksheet(sheet_name)
             data = worksheet.get_all_records()
             return pd.DataFrame(data)
         except gspread.WorksheetNotFound:
