@@ -1,164 +1,427 @@
-.streamlit/secrets.toml
+# Written by: Michael Jenks
+# Last update: 24/11/2025
 
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
+import gspread
+import requests
+import folium
 
-# C extensions
-*.so
+import altair as alt
+import streamlit as st
+import pandas as pd
+import geopandas as gpd
+#import numpy as np
+#import matplotlib.pyplot as plt
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+from google.oauth2.service_account import Credentials
+from shapely import wkt, wkb
+#from datetime import timedelta
+from PIL import Image
+from io import BytesIO
+from folium.plugins import FastMarkerCluster, Geocoder
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+class BackgroundCode:
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-cover/
+    def __init__(self):
+        self.locations = {
+            "Sporenburg": (52.373815, 4.945598),
+            "Roelantstraat": (52.376836, 4.856632),
+            "Vincent van Goghstraat": (52.349022, 4.888944),
+        }
+    
+    def load_Gsheets(
+            self, 
+            Gsheet_ID="1p2HqiGGOKvuZfjxSTOIi_NBotnnCxq0_0UG8hZhbM0g"
+            ):
+        # Load service account info securely from Streamlit secrets
+        
+        SCOPES = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        
+        creds = Credentials.from_service_account_info(st.secrets["google_service_account"], scopes=SCOPES)
+        gc = gspread.authorize(creds)
 
-# Translations
-*.mo
-*.pot
+        spreadsheet = gc.open_by_key(Gsheet_ID)
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+        return spreadsheet
 
-# Flask stuff:
-instance/
-.webassets-cache
+    def get_sheet_dataframe(self, sheet_name, sheet):
+        """Read a worksheet into a DataFrame."""
+        try:
+            worksheet = sheet.worksheet(sheet_name)
+            data = worksheet.get_all_records()
+            return pd.DataFrame(data)
+        except gspread.WorksheetNotFound:
+            st.warning(f"Worksheet '{sheet_name}' not found.")
+            return pd.DataFrame()
+        
+    def get_sheet_dataframe(self, sheet_name, sheet):
+        """Read a worksheet into a DataFrame."""
+        try:
+            worksheet = sheet.worksheet(sheet_name)
+            data = worksheet.get_all_records()
+            return pd.DataFrame(data)
+        except gspread.WorksheetNotFound:
+            st.warning(f"Worksheet '{sheet_name}' not found.")
+            return pd.DataFrame()
+        
+    # --- Build GeoDataFrames ---
+    @staticmethod
+    @st.cache_resource
+    def build_gebruik_df(_df):
+        col_list = [
+            "owner_msr",
+            "jvb_industrie",
+            "jvb_logies",
+            "jvb_onderwijs",
+            "jvb_winkel",
+            "jvb_woon",
+            "jvb_kantoor_gezondheid",
+            "jvb_sport_bijeenkomst_overig",
+            "percentage_evs_msr",
+            "aantal_personenautos_msr"
+        ]
+        output_df = _df[col_list].copy()
+        return output_df
 
-# Scrapy stuff:
-.scrapy
+    
 
-# Sphinx documentation
-docs/_build/
+    @staticmethod
+    @st.cache_resource
+    def build_msr_gdf(_df: pd.DataFrame) -> gpd.GeoDataFrame:
 
-# PyBuilder
-.pybuilder/
-target/
+        def to_geometry(val):
+            if pd.isna(val) or val == "":
+                return None
+            # Try WKT first
+            if isinstance(val, str):
+                try:
+                    return wkt.loads(val)
+                except Exception:
+                    pass
+                # Try WKB hex string
+                try:
+                    return wkb.loads(val, hex=True)
+                except Exception:
+                    print(f"Invalid geometry skipped: {val}")
+                    return None
+            # Already a Shapely geometry?
+            from shapely.geometry.base import BaseGeometry
+            if isinstance(val, BaseGeometry):
+                return val
+            return None
 
-# Jupyter Notebook
-.ipynb_checkpoints
+        _df["msr_coordinates"] = _df["msr_coordinates"].apply(to_geometry)
 
-# IPython
-profile_default/
-ipython_config.py
+        # Filter out rows that couldn't be converted, optional
+        #_df = _df[_df["msr_coordinates"].notna()]
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+        return gpd.GeoDataFrame(_df, geometry="msr_coordinates", crs="EPSG:28992")
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
+    @staticmethod
+    @st.cache_resource
+    
+    def build_vbo_gdf(_df: pd.DataFrame, col_name: str) -> gpd.GeoDataFrame:
+        
+        def to_geometry(val):
+            if pd.isna(val) or val.strip() == "":
+                return None
+            # Try WKT
+            if isinstance(val, str):
+                try:
+                    return wkt.loads(val)
+                except Exception:
+                    # Try WKB hex
+                    try:
+                        return wkb.loads(val, hex=True)
+                    except Exception:
+                        print(f"Invalid geometry skipped: {val}")
+                        return None
+            # Already a Shapely geometry?
+            from shapely.geometry.base import BaseGeometry
+            if isinstance(val, BaseGeometry):
+                return val
+            return None
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-#poetry.lock
+        _df[col_name] = _df[col_name].apply(to_geometry)
+        
+        # Optionally remove rows that couldn't be converted
+        _df = _df[_df[col_name].notna()]
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#pdm.lock
-#   pdm stores project-wide configurations in .pdm.toml, but it is recommended to not include it
-#   in version control.
-#   https://pdm.fming.dev/latest/usage/project/#working-with-version-control
-.pdm.toml
-.pdm-python
-.pdm-build/
+        return gpd.GeoDataFrame(_df, geometry=col_name, crs="EPSG:28992")
+    
+    # --- Build map fresh each run (not cached) ---
+    def build_base_map(self, _gdf):
+        gdf_wgs = _gdf.to_crs(epsg=4326)
+        m = folium.Map(location=[gdf_wgs.geometry.y.mean(), gdf_wgs.geometry.x.mean()], zoom_start=7)
+        callback = """
+        function (row) {
+            var marker = L.marker(new L.LatLng(row[0], row[1]));
+            marker.bindPopup(String(row[2]));
+            marker.bindTooltip(String(row[2]));
+            return marker;
+        }
+        """
+        coords = list(zip(gdf_wgs.geometry.y, gdf_wgs.geometry.x, gdf_wgs["owner_msr"]))
+        FastMarkerCluster(coords, callback=callback).add_to(m)
+        return m
+    
+    def profile_creator(self, df_profiles, msr_row, EV_adoption_perc, EV_jvb_per_auto):
+        #import inspect
+        #st.write("Function called from:")
+        #st.write(inspect.stack()[1])
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+        df_MSR_profile = pd.DataFrame()
+        #msr_row = df_MSRs[df_MSRs['owner_msr'] == MSR_ID]
+        if len(msr_row.index) is not 1:
+            st.write("Error in MSR matches")
 
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
+        df_MSR_profile["DATUM_TIJDSTIP_2024"] = df_profiles["DATUM_TIJDSTIP_2024"].copy()
 
-# SageMath parsed files
-*.sage.py
+        df_MSR_profile["Woningen totaal [kW]"] = df_profiles["jvb_woon"].copy()*msr_row["jvb_woon"].iloc[0]*4
+        df_MSR_profile["Winkel [kW]"] = df_profiles["jvb_winkel"].copy()*msr_row["jvb_winkel"].iloc[0]*4
+        df_MSR_profile["Onderwijs [kW]"] = df_profiles["jvb_onderwijs"].copy()*msr_row["jvb_onderwijs"].iloc[0]*4
+        df_MSR_profile["Logies [kW]"] = df_profiles["jvb_logies"].copy()*msr_row["jvb_logies"].iloc[0]*4
+        df_MSR_profile["Industrie [kW]"] = df_profiles["jvb_industrie"].copy()*msr_row["jvb_industrie"].iloc[0]*4
+        df_MSR_profile["Kantoor_Gezondsheid [kW]"] = df_profiles["jvb_kantoor_gezondheid"].copy()*msr_row["jvb_kantoor_gezondheid"].iloc[0]*4
+        df_MSR_profile["Sport_Bijeenkomst_Overig [kW]"] = df_profiles["jvb_sport_bijeenkomst_overig"].copy()*msr_row["jvb_sport_bijeenkomst_overig"].iloc[0]*4
 
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+        # EV and solar
+        df_MSR_profile["EV oplaad [kW]"] = df_profiles["Elaad_normal_norm. [kWh/kWh]"].copy()*msr_row["aantal_personenautos_msr"].iloc[0]*EV_adoption_perc/100*EV_jvb_per_auto*4 # (KWh per EV per year)
+        
+        df_MSR_profile["Utiliteit totaal [kW]"] = df_MSR_profile["Winkel [kW]"] + df_MSR_profile["Onderwijs [kW]"] + df_MSR_profile["Kantoor_Gezondsheid [kW]"] + df_MSR_profile["Industrie [kW]"] + df_MSR_profile["Sport_Bijeenkomst_Overig [kW]"] + df_MSR_profile["Logies [kW]"]
+        
+        df_MSR_profile["MSR totaal [kW]"] = df_MSR_profile["Woningen totaal [kW]"] + df_MSR_profile["Utiliteit totaal [kW]"] + df_MSR_profile["EV oplaad [kW]"] # + df_MSR_profile["Zonnepanelen [kW]"] + df_MSR_profile["Oplaad punten [kW]"]
+        df_MSR_profile["MSR totaal_base profile [kW]"] = df_MSR_profile["MSR totaal [kW]"]
+        df_MSR_profile["DATUM_TIJDSTIP_2024"] = pd.to_datetime(df_MSR_profile["DATUM_TIJDSTIP_2024"], dayfirst=True)
 
-# Spyder project settings
-.spyderproject
-.spyproject
+        return df_MSR_profile
+    
+    def update_charge_strat(self, df, charge_strat, df_profiles, msr_row, EV_adoption_perc, EV_jvb_per_auto):
+        charge_profile_name = self.charge_profile_lookup(charge_strat)
 
-# Rope project settings
-.ropeproject
+        #msr_row = df_MSRs[df_MSRs['owner_msr'] == MSR_ID]
 
-# mkdocs documentation
-/site
+        # this data still to be added to gsheets
+        #df["Oplaad punten [kW]"] = df_profiles[charge_profile_name].copy()*msr_row["jvb_EV"]*4
+        df["EV oplaad [kW]"] = df_profiles[charge_profile_name].copy()*msr_row["aantal_personenautos_msr"].iloc[0]*EV_adoption_perc/100*EV_jvb_per_auto*4
+        df["MSR totaal [kW]"] = df["Woningen totaal [kW]"] + df["Utiliteit totaal [kW]"] + df["EV oplaad [kW]"]
+   
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
+        return df
 
-# Pyre type checker
-.pyre/
+    def charge_profile_lookup(self, charge_strat):
+        
+        if charge_strat == "Regular on-demand charging":
+            #prof_name = "Charge point energy_normalised [kWh/kWh]"
+            prof_name = "Elaad_normal_norm. [kWh/kWh]"
+        
+        if charge_strat == "Grid-aware smart charging":
+            prof_name = "Elaad_net_bewust_norm. [kWh/kWh]"
 
-# pytype static type analyzer
-.pytype/
+        if charge_strat == "Capacity pooling":
+            prof_name = "Elaad_cap_pooling_norm. [kWh/kWh]"
 
-# Cython debug symbols
-cython_debug/
+        if charge_strat == "V2G":
+            prof_name = "Elaad_V2G_norm. [kWh/kWh]"
 
-# PyCharm
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+        return prof_name
+    
+    def prepare_plot_df(self, start_date, end_date, df):
+        mask = (df["DATUM_TIJDSTIP_2024"] >= pd.to_datetime(start_date)) & (df["DATUM_TIJDSTIP_2024"] <= pd.to_datetime(end_date))
+        
+        df_slice = df.loc[mask]
+
+        # --- add to cols to plot ---
+        cols_to_plot = [
+            "Woningen totaal [kW]",
+            "Utiliteit totaal [kW]",
+            #"Zonnepanelen [kW]",
+            "EV oplaad [kW]",
+            "MSR totaal [kW]"
+        ]
+        
+        # --- store into session_state
+        st.session_state["df_plot_data"] = df_slice.set_index("DATUM_TIJDSTIP_2024")[cols_to_plot]
+
+    def plot_df_with_dashed_lines(
+            self,
+            df,
+            placeholder,
+            dashed_series = [
+                "EV oplaad [kW]",
+                "Utiliteit totaal [kW]",
+                "Woningen totaal [kW]",
+            ],
+            max_base_profile=None
+        ):
+        if df is None or df.empty:
+            placeholder.write("No data to plot.")
+            return
+
+        legend_order = [
+            "MSR totaal [kW]",
+            "Woningen totaal [kW]",
+            "Utiliteit totaal [kW]",
+            "EV oplaad [kW]",
+        ]
+        
+        # Reset index safely
+        df_reset = df.reset_index()
+
+        # Identify the index column (the column added by reset_index)
+        index_col = df_reset.columns[0]
+
+        # Ensure datetime index is treated correctly
+        df_reset[index_col] = pd.to_datetime(df_reset[index_col])
+
+        # Convert to long format
+        df_long = df_reset.melt(
+            id_vars=index_col,
+            var_name="series",
+            value_name="value"
+        )
+
+        # Build main line chart
+        chart = (
+            alt.Chart(df_long)
+            .mark_line()
+            .encode(
+                x=alt.X(index_col + ":T", title="Date"),
+                y=alt.Y("value:Q", title="Power [kW]"),
+                color=alt.Color(
+                    "series:N",
+                    title="",
+                    scale=alt.Scale(domain=legend_order),
+                    sort=legend_order
+                ),
+                strokeDash=alt.condition(
+                    alt.FieldOneOfPredicate(field="series", oneOf=dashed_series),
+                    alt.value([4, 4]),       # dashed style
+                    alt.value([1, 0])        # solid style
+                ),
+                strokeWidth=alt.condition(
+                    alt.FieldOneOfPredicate(field="series", oneOf=dashed_series),
+                    alt.value(1),            # thinner dashed lines
+                    alt.value(2.5)           # thicker solid lines
+                )
+            )
+        )
+        
+        # Add horizontal red line for max base profile if provided
+        if max_base_profile is not None:
+            rule = alt.Chart(pd.DataFrame({'y': [max_base_profile]})).mark_rule(
+                color='red',
+                strokeDash=[5, 5],
+                strokeWidth=2
+            ).encode(
+                y='y:Q'
+            )
+            
+            # Add text annotation for the line
+            text = alt.Chart(pd.DataFrame({
+                'y': [max_base_profile],
+                'label': [f'Max standaard: {int(max_base_profile)} kW']
+            })).mark_text(
+                align='right',
+                dx=-5,
+                dy=-5,
+                color='red',
+                fontSize=11,
+                fontWeight='bold'
+            ).encode(
+                x=alt.value(0),  # Position at the left
+                y='y:Q',
+                text='label:N'
+            )
+            
+            # Combine all layers
+            chart = (chart + rule + text).properties(
+                padding={"bottom": 40}
+            )
+        else:
+            chart = chart.properties(
+                padding={"bottom": 40}
+            )
+
+        # Render chart
+        placeholder.altair_chart(chart, use_container_width=True)
+
+    @staticmethod
+    @st.cache_resource
+    def image_converter(URL, R, G, B, A, width=None):
+        response = requests.get(URL)
+        
+        try:
+            image = Image.open(BytesIO(response.content)).convert("RGBA")
+            background = Image.new("RGBA", image.size, (R, G, B, A))
+            background.paste(image, (0,0), image)
+            final_image = background.convert("RGB")
+
+            if width:
+                w, h = final_image.size
+                ratio = width / w
+                new_height = int(h * ratio)
+                final_image = final_image.resize((width, new_height), Image.LANCZOS)
+
+            return final_image
+        
+        except:
+            return None
+        
+    def load_room_objects(self, room_id):
+        """Load objects associated with a specific voltage room"""
+        try:
+            conn = st.connection("postgresql", type="sql")
+    
+            # Perform query.
+            objects_df = conn.query('SELECT * FROM Objectsmichael;', ttl="10m")
+
+            # Handle the unnamed index column if it exists
+            if '' in objects_df.columns or 'Unnamed: 0' in objects_df.columns:
+                objects_df = objects_df.drop(columns=[col for col in objects_df.columns if col == '' or col.startswith('Unnamed')])
+            return objects_df
+        except Exception as e:
+            st.warning(f"Could not load objects for room {room_id}: {e}")
+            return None
+
+    def load_room_objects2(self, selected_msr, table_name):
+        """Load objects associated with a specific voltage room"""
+        
+        conn = st.connection("postgresql", type="sql")
+
+        objects_df = conn.query(
+            f"""
+            SELECT *
+            FROM {table_name}
+            WHERE owner_msr = :msr
+            """,
+            params={"msr": selected_msr},
+            ttl="10m"
+        )
+
+        # Perform query.
+        #objects_df = conn.query('SELECT * FROM "ObjectsMichael";', ttl="10m")
+
+        # Handle the unnamed index column if it exists
+        if '' in objects_df.columns or 'Unnamed: 0' in objects_df.columns:
+            objects_df = objects_df.drop(columns=[col for col in objects_df.columns if col == '' or col.startswith('Unnamed')])
+        return objects_df
+    
+    def test_connection(self):
+
+        conn = st.connection("postgresql", type="sql")
+
+        test_output = conn.query(
+            """
+            SELECT schemaname, tablename
+            FROM pg_tables
+            WHERE tablename ILIKE '%michael%';
+            """
+        )
+
+        return test_output
+if __name__ == "__main__":
+    loaded = load_Gsheets()
