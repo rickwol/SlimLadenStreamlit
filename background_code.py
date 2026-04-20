@@ -190,10 +190,11 @@ class BackgroundCode:
 
         # EV and solar
         df_MSR_profile["EV oplaad [kW]"] = df_profiles["Elaad_normal_norm. [kWh/kWh]"].copy()*msr_row["aantal_personenautos_msr"].iloc[0]*EV_adoption_perc/100*EV_jvb_per_auto*4 # (KWh per EV per year)
+        df_MSR_profile["Zonnepanelen [kW]"] = -df_profiles["ZP normalised energy [kWh/kWh]"].copy()*msr_row["jaaropwek_pv"].iloc[0]*4
         
         df_MSR_profile["Utiliteit totaal [kW]"] = df_MSR_profile["Winkel [kW]"] + df_MSR_profile["Onderwijs [kW]"] + df_MSR_profile["Kantoor_Gezondsheid [kW]"] + df_MSR_profile["Industrie [kW]"] + df_MSR_profile["Sport_Bijeenkomst_Overig [kW]"] + df_MSR_profile["Logies [kW]"]
         
-        df_MSR_profile["MSR totaal [kW]"] = df_MSR_profile["Woningen totaal [kW]"] + df_MSR_profile["Utiliteit totaal [kW]"] + df_MSR_profile["EV oplaad [kW]"] # + df_MSR_profile["Zonnepanelen [kW]"] + df_MSR_profile["Oplaad punten [kW]"]
+        df_MSR_profile["MSR totaal [kW]"] = df_MSR_profile["Woningen totaal [kW]"] + df_MSR_profile["Utiliteit totaal [kW]"] + df_MSR_profile["EV oplaad [kW]"] + df_MSR_profile["Zonnepanelen [kW]"] #+ df_MSR_profile["Oplaad punten [kW]"]
         df_MSR_profile["MSR totaal_base profile [kW]"] = df_MSR_profile["MSR totaal [kW]"]
         df_MSR_profile["DATUM_TIJDSTIP_2024"] = pd.to_datetime(df_MSR_profile["DATUM_TIJDSTIP_2024"], dayfirst=True)
 
@@ -207,7 +208,7 @@ class BackgroundCode:
         # this data still to be added to gsheets
         #df["Oplaad punten [kW]"] = df_profiles[charge_profile_name].copy()*msr_row["jvb_EV"]*4
         df["EV oplaad [kW]"] = df_profiles[charge_profile_name].copy()*msr_row["aantal_personenautos_msr"].iloc[0]*EV_adoption_perc/100*EV_jvb_per_auto*4
-        df["MSR totaal [kW]"] = df["Woningen totaal [kW]"] + df["Utiliteit totaal [kW]"] + df["EV oplaad [kW]"]
+        df["MSR totaal [kW]"] = df["Woningen totaal [kW]"] + df["Utiliteit totaal [kW]"] + df["EV oplaad [kW]"] + df["Zonnepanelen [kW]"] 
    
 
         return df
@@ -238,7 +239,7 @@ class BackgroundCode:
         cols_to_plot = [
             "Woningen totaal [kW]",
             "Utiliteit totaal [kW]",
-            #"Zonnepanelen [kW]",
+            "Zonnepanelen [kW]",
             "EV oplaad [kW]",
             "MSR totaal [kW]"
         ]
@@ -254,6 +255,7 @@ class BackgroundCode:
                 "EV oplaad [kW]",
                 "Utiliteit totaal [kW]",
                 "Woningen totaal [kW]",
+                "Zonnepanelen [kW]"
             ],
             max_base_profile=None
         ):
@@ -266,6 +268,7 @@ class BackgroundCode:
             "Woningen totaal [kW]",
             "Utiliteit totaal [kW]",
             "EV oplaad [kW]",
+            "Zonnepanelen [kW]"
         ]
         
         # Reset index safely
