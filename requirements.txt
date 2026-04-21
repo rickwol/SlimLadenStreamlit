@@ -7,3 +7,4 @@ streamlit_folium
 sqlalchemy
 psycopg2-binary
 geopy
+numpy
