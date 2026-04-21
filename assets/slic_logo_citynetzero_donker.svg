@@ -1,0 +1,93 @@
+<svg width="480" height="160" viewBox="0 0 480 160" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      @keyframes ring-loop {
+        0%   { stroke-dashoffset: 226; }
+        60%  { stroke-dashoffset: 0; }
+        85%  { stroke-dashoffset: 0; }
+        100% { stroke-dashoffset: 226; }
+      }
+      @keyframes draw-p1 {
+        0%   { stroke-dashoffset: 380; }
+        40%  { stroke-dashoffset: 0; }
+        85%  { stroke-dashoffset: 0; }
+        100% { stroke-dashoffset: 380; }
+      }
+      @keyframes draw-p2 {
+        0%, 8% { stroke-dashoffset: 340; }
+        48%  { stroke-dashoffset: 0; }
+        85%  { stroke-dashoffset: 0; }
+        100% { stroke-dashoffset: 340; }
+      }
+      @keyframes draw-p3 {
+        0%, 15% { stroke-dashoffset: 280; }
+        55%  { stroke-dashoffset: 0; }
+        85%  { stroke-dashoffset: 0; }
+        100% { stroke-dashoffset: 280; }
+      }
+      @keyframes pulse {
+        0%, 100% { r: 3; opacity: 1; }
+        50%       { r: 5; opacity: 0.4; }
+      }
+      @keyframes bolt {
+        0%, 70%, 100% { opacity: 1; }
+        75% { opacity: 0.1; }
+        82% { opacity: 1; }
+        88% { opacity: 0.3; }
+      }
+      .ring-anim { stroke-dasharray: 226; animation: ring-loop 5s ease-in-out infinite; }
+      .p1 { stroke-dasharray: 380; animation: draw-p1 5s ease-in-out infinite; }
+      .p2 { stroke-dasharray: 340; animation: draw-p2 5s ease-in-out infinite; }
+      .p3 { stroke-dasharray: 280; animation: draw-p3 5s ease-in-out infinite; }
+      .dot { animation: pulse 2.5s ease-in-out infinite; }
+      .bolt-el { animation: bolt 5s ease-in-out infinite; }
+    </style>
+  </defs>
+
+  <!-- Background -->
+  <rect width="480" height="160" fill="#0D2137" rx="12"/>
+
+  <!-- Icon -->
+  <circle cx="80" cy="80" r="58" fill="none" stroke="rgba(93,202,165,0.15)" stroke-width="0.8" stroke-dasharray="4 2.5"/>
+  <circle cx="80" cy="80" r="48" fill="none" stroke="rgba(93,202,165,0.2)" stroke-width="5"/>
+  <circle cx="80" cy="80" r="48" fill="none" stroke="#5DCAA5" stroke-width="5"
+    stroke-linecap="round" transform="rotate(-90 80 80)" class="ring-anim"/>
+  <circle cx="80" cy="80" r="38" fill="rgba(93,202,165,0.04)"/>
+
+  <line x1="46" y1="96" x2="114" y2="96" stroke="rgba(93,202,165,0.2)" stroke-width="0.7"/>
+  <line x1="46" y1="82" x2="114" y2="82" stroke="rgba(93,202,165,0.2)" stroke-width="0.7"/>
+  <line x1="46" y1="68" x2="114" y2="68" stroke="rgba(93,202,165,0.2)" stroke-width="0.7"/>
+  <line x1="46" y1="102" x2="114" y2="102" stroke="rgba(93,202,165,0.35)" stroke-width="0.8"/>
+
+  <polyline points="46,101 54,101 58,72 66,69 72,73 79,91 85,88 92,65 100,63 107,67 111,101 114,101"
+    fill="none" stroke="#5DCAA5" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" class="p1"/>
+  <polyline points="46,101 53,101 57,55 65,52 71,55 79,90 87,98 100,100 114,101"
+    fill="none" stroke="#9FE1CB" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+    stroke-dasharray="5 2.5" class="p2" opacity="0.5"/>
+  <polyline points="46,100 58,100 65,88 74,82 83,85 93,90 104,95 114,99"
+    fill="none" stroke="#EF741D" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+    opacity="0.85" class="p3"/>
+
+  <circle cx="114" cy="101" r="3" fill="#5DCAA5" class="dot"/>
+
+  <circle cx="118" cy="42" r="14" fill="rgba(93,202,165,0.12)" stroke="#5DCAA5" stroke-width="1.5"/>
+  <path d="M121 34 L115 43 L119 43 L113 52 L123 41 L119 41 Z" fill="#5DCAA5" class="bolt-el"/>
+
+  <line x1="158" y1="28" x2="158" y2="132" stroke="rgba(93,202,165,0.25)" stroke-width="0.8"/>
+
+  <text x="178" y="100" font-family="Georgia, 'Times New Roman', serif" font-size="62" font-weight="700"
+    letter-spacing="-2" fill="#5DCAA5">SLIC</text>
+  <text x="178" y="120" font-family="Arial, Helvetica, sans-serif" font-size="9" font-weight="500"
+    letter-spacing="2.5" fill="#9FE1CB">SLIM LADEN IMPACT CALCULATOR</text>
+  <text x="178" y="134" font-family="Arial, Helvetica, sans-serif" font-size="9" font-style="italic"
+    fill="rgba(159,225,203,0.6)" letter-spacing="0.3">bereken jouw lokale impact</text>
+
+  <line x1="178" y1="143" x2="470" y2="143" stroke="rgba(93,202,165,0.2)" stroke-width="0.6"/>
+  <line x1="178" y1="153" x2="198" y2="153" stroke="#5DCAA5" stroke-width="2" stroke-linecap="round"/>
+  <text x="203" y="157" font-family="Arial, Helvetica, sans-serif" font-size="8.5" fill="rgba(255,255,255,0.7)">slim laden</text>
+  <line x1="258" y1="153" x2="278" y2="153" stroke="rgba(159,225,203,0.6)" stroke-width="1.8"
+    stroke-dasharray="5 2.5" stroke-linecap="round"/>
+  <text x="283" y="157" font-family="Arial, Helvetica, sans-serif" font-size="8.5" fill="rgba(255,255,255,0.7)">ongestuurd laden</text>
+  <line x1="376" y1="153" x2="396" y2="153" stroke="#EF741D" stroke-width="1.8" stroke-linecap="round" opacity="0.85"/>
+  <text x="401" y="157" font-family="Arial, Helvetica, sans-serif" font-size="8.5" fill="rgba(255,255,255,0.7)">V2G</text>
+</svg>
