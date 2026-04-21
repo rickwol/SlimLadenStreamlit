@@ -365,7 +365,7 @@ with right_col:
             # Only show number of cars KPI
             st.markdown(f"""
             <div style='background-color: #f0f2f6; padding: 15px; border-radius: 10px; margin-bottom: 10px;'>
-                <p style='color: #666; font-size: 14px; margin: 0;'>Aantal auto's (waarvan {EV_perc_current}% EV)</p>
+                <p style='color: #666; font-size: 14px; margin: 0;'>Aantal auto's (waarvan {EV_adoption_perc}% EV)</p>
                 <p style='color: #1f77b4; font-size: 28px; font-weight: bold; margin: 5px 0;'>{num_autos:,}</p>
             </div>
             """, unsafe_allow_html=True)
