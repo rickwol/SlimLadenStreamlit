@@ -14,13 +14,14 @@ from geopy.exc import GeocoderTimedOut
 
 st.set_page_config(layout="wide")
 
-title_col, logo_col = st.columns([4, 1])
+title_col, logo_col = st.columns([4, 2])
 with title_col:
     st.title("Modelleeromgeving voor alle middenspanningsstations in Nederland")
 with logo_col:
-    st.image("assets/slic_logo_citynetzero_donker.svg", width=200)
+    st.image("assets/slic_logo_citynetzero_donker.svg", width=400)
 st.write("Selecteer het MSR dat je wilt analyseren.")
-st.write("Voor vragen of opmerkingen, neem contact op met m.j.f.jenks@hva.nl")
+st.markdown('<a href="mailto:m.j.f.jenks@hva.nl">Vragen of opmerkingen</a>', unsafe_allow_html=True)
+#st.write("Voor vragen of opmerkingen, neem contact op met m.j.f.jenks@hva.nl")
 
 if st.button("🔄 Data Verversen"):
     st.cache_resource.clear()
