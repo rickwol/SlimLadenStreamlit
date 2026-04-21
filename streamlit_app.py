@@ -14,7 +14,11 @@ from geopy.exc import GeocoderTimedOut
 
 st.set_page_config(layout="wide")
 
-st.title("Modelleeromgeving voor alle middenspanningsstations in Nederland")
+title_col, logo_col = st.columns([4, 1])
+with title_col:
+    st.title("Modelleeromgeving voor alle middenspanningsstations in Nederland")
+with logo_col:
+    st.image("assets/slic_logo_citynetzero_donker.svg", width=200)
 st.write("Selecteer het MSR dat je wilt analyseren.")
 st.write("Voor vragen of opmerkingen, neem contact op met m.j.f.jenks@hva.nl")
 
