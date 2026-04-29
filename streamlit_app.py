@@ -1,14 +1,12 @@
-import folium
 import codecs
+import pydeck as pdk
 import background_code
 import streamlit as st
 import pandas as pd
 import geopandas as gpd
 
-from folium.plugins import FastMarkerCluster, Geocoder
 from shapely import wkb
 from datetime import timedelta, datetime
-from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut
 
@@ -21,7 +19,6 @@ with logo_col:
     st.image("assets/slic_logo_citynetzero_donker.svg", width=400)
 st.write("Selecteer het MSR dat je wilt analyseren.")
 st.markdown('<a href="mailto:m.j.f.jenks@hva.nl">Vragen of opmerkingen</a>', unsafe_allow_html=True)
-#st.write("Voor vragen of opmerkingen, neem contact op met m.j.f.jenks@hva.nl")
 
 if st.button("🔄 Data Verversen"):
     st.cache_resource.clear()
@@ -49,412 +46,512 @@ msr_gdf = bg.build_msr_gdf(st.session_state.MSRs)
 profielen_df = st.session_state.profielen
 gebruik_df = bg.build_gebruik_df(st.session_state.vbo_objects)
 
-# --- Session state ---
+# --- Session state defaults ---
 if "selected_id" not in st.session_state:
     st.session_state.selected_id = None
-
 if "map_center" not in st.session_state:
     st.session_state.map_center = None
-
 if "map_zoom" not in st.session_state:
     st.session_state.map_zoom = 7
-
-# Store original peak power (before EV adoption changes)
 if "original_peak_power" not in st.session_state:
     st.session_state.original_peak_power = None
+if "last_msr_id" not in st.session_state:
+    st.session_state.last_msr_id = None
+    st.session_state.cached_df = None
+if "min_max" not in st.session_state:
+    st.session_state.min_max = "-"
+if "awaiting_confirmation" not in st.session_state:
+    st.session_state.awaiting_confirmation = False
+if "df_plot_data" not in st.session_state:
+    st.session_state.df_plot_data = None
 
-# Function to get address from coordinates
-@st.cache_data
+
+@st.cache_data(ttl=86400, show_spinner=False)
 def get_address_from_coords(lat, lon):
-    """Reverse geocode coordinates to get address"""
+    """Reverse geocode MSR coordinates to a human-readable Dutch address."""
+    import math
+    if lat is None or lon is None or math.isnan(float(lat)) or math.isnan(float(lon)):
+        return None
+    try:
+        geolocator = Nominatim(user_agent="SlimLaden-MSR-App/1.0 (m.j.f.jenks@hva.nl)")
+        location = geolocator.reverse(f"{lat}, {lon}", timeout=15, language='nl')
+        if not location or not location.address:
+            return None
+        addr = location.raw.get('address', {})
+        street = addr.get('road', '')
+        house_number = addr.get('house_number', '')
+        # MSRs are often in industrial areas — fall back through all place levels
+        city = (
+            addr.get('city')
+            or addr.get('town')
+            or addr.get('village')
+            or addr.get('municipality')
+            or addr.get('county')
+            or addr.get('state_district')
+            or ''
+        )
+        if street and city:
+            return f"{street} {house_number}, {city}".replace(" ,", ",").strip()
+        elif street:
+            return street
+        elif city:
+            return city
+        else:
+            return location.address.split(',')[0]
+    except GeocoderTimedOut:
+        return None
+    except Exception:
+        return None
+
+
+@st.cache_data
+def geocode_address(address):
     try:
         geolocator = Nominatim(user_agent="msr_app")
-        location = geolocator.reverse(f"{lat}, {lon}", timeout=10, language='nl')
-        if location and location.address:
-            # Extract street and city from address
-            addr_parts = location.raw.get('address', {})
-            street = addr_parts.get('road', '')
-            house_number = addr_parts.get('house_number', '')
-            city = addr_parts.get('city') or addr_parts.get('town') or addr_parts.get('village', '')
-            
-            # Build clean address
-            if street and city:
-                if house_number:
-                    return f"{street} {house_number}, {city}"
-                else:
-                    return f"{street}, {city}"
-            elif city:
-                return city
-            else:
-                return location.address.split(',')[0]  # First part of full address
+        location = geolocator.geocode(address + ", Nederland", timeout=10)
+        if location:
+            return (location.latitude, location.longitude)
         return None
     except:
         return None
 
-# Build map
-if st.session_state.map_center:
-    m = folium.Map(
-        location=st.session_state.map_center, 
-        zoom_start=st.session_state.map_zoom
-    )
-    
-    # Add orange marker for searched location
-    folium.CircleMarker(
-        location=st.session_state.map_center,
-        radius=10,
-        color='orange',
-        fill=True,
-        fill_color='orange',
-        fill_opacity=0.7,
-        popup="Gezocht adres",
-        tooltip="Gezocht adres"
-    ).add_to(m)
-    
-    # Add MSR markers
-    gdf_wgs = msr_gdf.to_crs(epsg=4326)
-    callback = """
-    function (row) {
-        var marker = L.marker(new L.LatLng(row[0], row[1]));
-        marker.bindPopup(String(row[2]));
-        marker.bindTooltip(String(row[2]));
-        return marker;
-    }
+
+def normalize_msr_id(val):
+    """Normalize owner_msr to a consistent string.
+    Converts numeric floats ('12345.0' → '12345'), leaves non-numeric ('NO_MSR') as-is.
     """
-    coords = list(zip(gdf_wgs.geometry.y, gdf_wgs.geometry.x, gdf_wgs["owner_msr"]))
-    FastMarkerCluster(coords, callback=callback).add_to(m)
-else:
-    m = bg.build_base_map(msr_gdf)
+    s = str(val).strip()
+    try:
+        return str(int(float(s)))
+    except (ValueError, TypeError):
+        return s
 
-# Add Geocoder plugin to the map
-Geocoder(
-    collapsed=False,
-    position='topleft',
-    placeholder='Zoek een adres in Nederland...',
-).add_to(m)
 
-# --- Create grid layout ---
-left_col, right_col = st.columns([1, 1])
-
-with left_col:
-    # Reset button (optional - if you want to reset the map view)
-    if st.button("🔄 Reset kaartweergave"):
-        st.session_state.map_center = None
-        st.session_state.map_zoom = 7
-        st.rerun()
-    
-    st.markdown("---")
-    
-    map_data = st_folium(
-        m,
-        width="100%",
-        height=600,
-        key="main_map",
-    )
-
-    if map_data.get("last_object_clicked_tooltip"):
-        st.session_state.selected_id = map_data["last_object_clicked_tooltip"]
-    
-    if "last_msr_id" not in st.session_state:
-        st.session_state.last_msr_id = None
-        st.session_state.cached_df = None
-
-    current_id = st.session_state.get("selected_id")
-
-    if current_id != st.session_state.last_msr_id:
-        st.session_state.cached_df = bg.load_room_objects2(
-            current_id,
-            "datamichael13april26"
-        )
-        st.session_state.last_msr_id = current_id
-
-    #st.dataframe(st.session_state.cached_df)
-    def parse_wkb(val):
+def parse_wkb(val):
+    if val is None:
+        return None
+    try:
         if isinstance(val, str):
             if val.startswith("\\x"):
                 val = val[2:]
             return wkb.loads(bytes.fromhex(val))
         return wkb.loads(val)
+    except Exception:
+        return None
 
-    if st.session_state.selected_id:
-        df = st.session_state.cached_df.copy()
+
+@st.cache_data
+def get_msr_points(_msr_gdf):
+    """Convert MSR GeoDataFrame to a plain DataFrame with lon/lat for PyDeck."""
+    gdf_wgs = _msr_gdf.to_crs(epsg=4326)
+    return pd.DataFrame({
+        "lon": gdf_wgs.geometry.x.tolist(),
+        "lat": gdf_wgs.geometry.y.tolist(),
+        "owner_msr": gdf_wgs["owner_msr"].astype(str).tolist(),
+    })
+
+
+def build_buildings_layer(cached_df, selected_id):
+    """Parse WKB building geometries and return a red PyDeck ScatterplotLayer.
+
+    Returns None when no valid points are found.
+    """
+    if cached_df is None or selected_id is None:
+        return None
+    try:
+        df = cached_df.copy()
         df["geometry"] = df["vbo_points"].apply(parse_wkb)
         houses_gdf = gpd.GeoDataFrame(df, geometry="geometry", crs="EPSG:28992")
 
         selected_houses = houses_gdf[
-            houses_gdf["owner_msr"].astype(int).astype(str) == str(st.session_state.selected_id)
+            houses_gdf["owner_msr"].apply(normalize_msr_id) == normalize_msr_id(selected_id)
         ].to_crs(epsg=4326)
 
-        if len(selected_houses) > 0:
-            house_map = folium.Map(
-                location=[
-                    selected_houses.geometry.centroid.y.mean(),
-                    selected_houses.geometry.centroid.x.mean()
-                ],
-                zoom_start=17
-            )
-            for geom in selected_houses.geometry:
-                if geom.geom_type == "Point":
-                    points = [geom]
-                else:
-                    points = geom.geoms
+        points = []
+        for geom in selected_houses.geometry:
+            if geom is None or geom.is_empty:
+                continue
+            if geom.geom_type == "Point":
+                points.append({"lon": geom.x, "lat": geom.y})
+            else:
+                for pt in geom.geoms:
+                    points.append({"lon": pt.x, "lat": pt.y})
 
-                for point in points:
-                    folium.CircleMarker(
-                        location=[point.y, point.x],
-                        radius=5,
-                        color="red",
-                        fill=True,
-                        fill_opacity=0.8,
-                    ).add_to(house_map)
+        if not points:
+            return None
 
-            st.subheader(f"Gebouwen aangesloten op MSR: {st.session_state.selected_id}")
-            st_folium(house_map, width="100%", height=400, key="house_map")
+        return pdk.Layer(
+            "ScatterplotLayer",
+            id="buildings",
+            data=pd.DataFrame(points),
+            get_position=["lon", "lat"],
+            get_fill_color=[220, 30, 30, 210],
+            get_line_color=[140, 0, 0, 255],
+            line_width_min_pixels=1,
+            radius_min_pixels=3,
+            radius_max_pixels=10,
+            get_radius=8,
+            pickable=False,
+        )
+    except Exception:
+        return None
+
+
+@st.fragment
+def render_map_panel():
+    """Kolom 1: MSR-kaart met gebouwen van het geselecteerde MSR als rode laag."""
+
+    col_search, col_reset = st.columns([3, 1])
+    with col_search:
+        address_input = st.text_input(
+            "Zoek een adres in Nederland...",
+            key="address_search",
+            placeholder="Bijv. Damrak 1, Amsterdam",
+        )
+    with col_reset:
+        st.write("")
+        if st.button("🔄 Reset kaart"):
+            st.session_state.map_center = None
+            st.session_state.map_zoom = 7
+            st.rerun(scope="app")
+
+    if address_input:
+        coords = geocode_address(address_input)
+        if coords:
+            st.session_state.map_center = list(coords)
+            st.session_state.map_zoom = 13
         else:
-            st.warning("Geen gebouwen gevonden voor dit MSR.")
-        
+            st.warning("Adres niet gevonden. Probeer een specifiekere zoekterm.")
+
+    st.markdown("---")
+
+    msr_data = get_msr_points(msr_gdf)
+
+    if st.session_state.map_center:
+        view_lat, view_lon = st.session_state.map_center
+        zoom = st.session_state.map_zoom
+    else:
+        view_lat = msr_data["lat"].mean()
+        view_lon = msr_data["lon"].mean()
+        zoom = 7
+
+    # Gebouwen-laag (rood) onder de MSR-markers zodat blauw er bovenop ligt
+    buildings_layer = build_buildings_layer(
+        st.session_state.cached_df, st.session_state.selected_id
+    )
+
+    msr_layer = pdk.Layer(
+        "ScatterplotLayer",
+        id="msr-markers",
+        data=msr_data,
+        get_position=["lon", "lat"],
+        get_fill_color=[31, 119, 180, 200],
+        get_line_color=[255, 255, 255, 220],
+        line_width_min_pixels=1,
+        radius_min_pixels=4,
+        radius_max_pixels=14,
+        get_radius=250,
+        pickable=True,
+        auto_highlight=True,
+        highlight_color=[255, 165, 0, 255],
+    )
+
+    # Layer-volgorde: gebouwen → MSR-markers → zoeklocatie (bovenste laag)
+    layers = []
+    if buildings_layer:
+        layers.append(buildings_layer)
+    layers.append(msr_layer)
+    if st.session_state.map_center:
+        search_lat, search_lon = st.session_state.map_center
+        layers.append(pdk.Layer(
+            "ScatterplotLayer",
+            id="search-location",
+            data=pd.DataFrame({"lon": [search_lon], "lat": [search_lat]}),
+            get_position=["lon", "lat"],
+            get_fill_color=[255, 140, 0, 210],
+            get_line_color=[180, 80, 0, 255],
+            line_width_min_pixels=2,
+            radius_min_pixels=8,
+            radius_max_pixels=18,
+            get_radius=400,
+            pickable=False,
+        ))
+
+    deck = pdk.Deck(
+        layers=layers,
+        initial_view_state=pdk.ViewState(
+            latitude=view_lat,
+            longitude=view_lon,
+            zoom=zoom,
+            pitch=0,
+        ),
+        map_provider="carto",
+        map_style="light",
+        tooltip={"text": "MSR: {owner_msr}"},
+    )
+
+    chart = st.pydeck_chart(
+        deck,
+        on_select="rerun",
+        selection_mode="single-object",
+        height=600,
+        use_container_width=True,
+    )
+
+    # Klik op MSR: laad gebouwen en herlaad volledige app
+    selected_objects = chart.selection.objects.get("msr-markers", []) if chart.selection.objects else []
+    if selected_objects:
+        new_id = str(selected_objects[0]["owner_msr"])
+        if new_id != str(st.session_state.last_msr_id):
+            st.session_state.map_center = [selected_objects[0]["lat"], selected_objects[0]["lon"]]
+            st.session_state.map_zoom = 14
+            st.session_state.selected_id = new_id
+            st.session_state.cached_df = bg.load_room_objects2(new_id, "datamichael13april26")
+            st.session_state.last_msr_id = new_id
+            st.session_state.original_peak_power = None
+            st.session_state.df_plot_data = None
+            st.rerun(scope="app")
+
     HvA_logo_url = "https://amsterdamgreencampus.nl/wp-content/uploads/2016/01/AmsUniOfAppSci.png"
     img = bg.image_converter(HvA_logo_url, 255, 255, 255, 255, 200)
-
     if img is not None:
         st.image(img)
 
-with right_col:
-    if st.session_state.selected_id:
-        # Try to get MSR location from the geodataframe
-        try:
-            # Filter msr_gdf to find the selected MSR
-            selected_msr = msr_gdf[msr_gdf['owner_msr'].astype(str) == str(st.session_state.selected_id)]
-            
-            if len(selected_msr) > 0:
-                # Convert to WGS84 for lat/lon
-                msr_wgs84 = selected_msr.to_crs(epsg=4326)
-                msr_lat = msr_wgs84.iloc[0].geometry.y
-                msr_lon = msr_wgs84.iloc[0].geometry.x
-                
-                # Get address from coordinates
-                msr_address = get_address_from_coords(msr_lat, msr_lon)
-                
-                if msr_address:
-                    st.subheader(f"MSR: {msr_address}")
-                    st.caption(f"ID: {st.session_state.selected_id} | Coördinaten: {msr_lat:.4f}, {msr_lon:.4f}")
+
+@st.fragment
+def render_analysis_panel():
+    """Kolom 2 (inputs) + kolom 3 (grafiek & KPIs) als één fragment.
+
+    Eén fragment zodat wijzigingen in de inputs direct de grafiek updaten
+    zonder de kaart opnieuw te renderen.
+    """
+    col_inputs, col_chart = st.columns([1, 1.4], gap="medium")
+
+    if not st.session_state.selected_id:
+        with col_inputs:
+            with st.container(border=True):
+                st.info("👈 Klik op een MSR punt op de kaart om hier details te zien.")
+        return
+
+    msr_row = st.session_state.cached_df
+    EV_jvb_per_auto = 3500
+
+    # ------------------------------------------------------------------ #
+    #  Kolom 2 – MSR-naam + alle invoer                                   #
+    # ------------------------------------------------------------------ #
+    with col_inputs:
+        with st.container(border=True):
+
+            # MSR header
+            try:
+                norm_id = normalize_msr_id(st.session_state.selected_id)
+                selected_msr = msr_gdf[msr_gdf['owner_msr'].apply(normalize_msr_id) == norm_id]
+                if len(selected_msr) > 0:
+                    msr_wgs84 = selected_msr.to_crs(epsg=4326)
+                    geom = msr_wgs84.geometry.iloc[0]
+                    if geom is not None and not geom.is_empty:
+                        msr_lat, msr_lon = geom.y, geom.x
+                        msr_address = get_address_from_coords(msr_lat, msr_lon)
+                        if msr_address:
+                            st.subheader(f"MSR: {msr_address}")
+                            st.caption(f"ID: {norm_id} | {msr_lat:.4f}, {msr_lon:.4f}")
+                        else:
+                            st.subheader(f"MSR: {norm_id}")
+                            st.caption(f"Coördinaten: {msr_lat:.4f}, {msr_lon:.4f}")
+                    else:
+                        st.subheader(f"MSR: {norm_id}")
                 else:
                     st.subheader(f"MSR: {st.session_state.selected_id}")
-                    st.caption(f"Coördinaten: {msr_lat:.4f}, {msr_lon:.4f}")
-            else:
-                st.subheader(f"MSR: {st.session_state.selected_id}")
-        except Exception as e:
-            # Fallback if geocoding fails
-            st.subheader(f"MSR: {st.session_state.selected_id}")
-            st.caption(f"(Adres kon niet worden opgehaald)")
-
-        msr_row = st.session_state.cached_df
-        EV_jvb_per_auto = 3500
-
-        if len(msr_row) > 0:
-            charge_strat = st.selectbox(
-                "Welke laadstrategie wil je toepassen?",
-                ("Regulier on-demand laden", "Netbewust slim laden", "Capaciteitspooling", "V2G"),
-                key="charge_strategy"
-            )
-            
-            # Map Dutch to English for internal use
-            charge_strat_map = {
-                "Regulier on-demand laden": "Regular on-demand charging",
-                "Netbewust slim laden": "Grid-aware smart charging",
-                "Capaciteitspooling": "Capacity pooling",
-                "V2G": "V2G"
-            }
-            charge_strat_en = charge_strat_map[charge_strat]
-
-            try:
-                if "aantal_evs_m_msr" in msr_row.columns and "aantal_personenautos_msr" in msr_row.columns:
-                    num_evs = msr_row["aantal_evs_m_msr"].iloc[0]
-                    num_cars = msr_row["aantal_personenautos_msr"].iloc[0]
-                    if num_cars > 0:
-                        EV_perc_current = int(num_evs * 100 / num_cars)
-                    else:
-                        EV_perc_current = 0
-                else:
-                    EV_perc_current = 25
-                    st.info("⚠️ EV data niet beschikbaar, standaard waarde van 25% wordt gebruikt")
             except Exception as e:
-                EV_perc_current = 25
-                st.warning(f"Fout bij berekenen EV percentage: {e}. Standaard 25% wordt gebruikt.")
-            
-            EV_adoption_perc = st.slider("Welk percentage EV-adoptie wil je modelleren?", EV_perc_current, 100, EV_perc_current)
+                st.subheader(f"MSR: {st.session_state.selected_id}")
+                st.caption(f"(Adres kon niet worden opgehaald: {e})")
 
-            df_output = bg.profile_creator(profielen_df, msr_row, EV_adoption_perc, EV_jvb_per_auto)
-            df_output = bg.update_charge_strat(df_output, charge_strat_en, profielen_df, msr_row, EV_adoption_perc, EV_jvb_per_auto)
-            
-            # Store original peak power when first loading this MSR (at current EV percentage)
-            if st.session_state.original_peak_power is None or st.session_state.get('last_loaded_msr') != st.session_state.selected_id:
-                st.session_state.original_peak_power = df_output["MSR totaal_base profile [kW]"].max()
-                st.session_state.last_loaded_msr = st.session_state.selected_id
+            if len(msr_row) == 0:
+                st.warning("Geen data beschikbaar voor dit MSR.")
+                # Zet lege waarden zodat kolom 3 veilig kan renderen
+                charge_strat = "Regulier on-demand laden"
+                EV_adoption_perc = 0
+                df_output = None
+                start_date = end_date = None
+            else:
+                st.markdown("---")
 
-            if "min_max" not in st.session_state:
-                st.session_state.min_max = "-"
+                charge_strat = st.selectbox(
+                    "Laadstrategie",
+                    ("Regulier on-demand laden", "Netbewust slim laden", "Capaciteitspooling", "V2G"),
+                    key="charge_strategy",
+                )
+                charge_strat_en = {
+                    "Regulier on-demand laden": "Regular on-demand charging",
+                    "Netbewust slim laden": "Grid-aware smart charging",
+                    "Capaciteitspooling": "Capacity pooling",
+                    "V2G": "V2G",
+                }[charge_strat]
 
-            if st.button("Verander naar dag met hoogste piekvermogen"):
-                date_max_power = df_output.loc[df_output["MSR totaal [kW]"].idxmax(), ("DATUM_TIJDSTIP_2024")]
-                st.session_state.date_max_power = date_max_power
-                st.session_state.min_max = "max"
+                try:
+                    if "aantal_evs_m_msr" in msr_row.columns and "aantal_personenautos_msr" in msr_row.columns:
+                        num_evs = msr_row["aantal_evs_m_msr"].iloc[0]
+                        num_cars = msr_row["aantal_personenautos_msr"].iloc[0]
+                        EV_perc_current = int(num_evs * 100 / num_cars) if num_cars > 0 else 0
+                    else:
+                        EV_perc_current = 25
+                        st.info("⚠️ EV data niet beschikbaar, standaard 25% wordt gebruikt")
+                except Exception as e:
+                    EV_perc_current = 25
+                    st.warning(f"Fout bij EV percentage: {e}. Standaard 25% wordt gebruikt.")
 
-            if st.button("Verander naar dag met laagste (of meest negatieve) piekvermogen"):
-                date_min_power = df_output.loc[df_output["MSR totaal [kW]"].idxmin(), ("DATUM_TIJDSTIP_2024")]
-                st.session_state.date_min_power = date_min_power
-                st.session_state.min_max = "min"
+                EV_adoption_perc = st.slider(
+                    f"EV-adoptie percentage (huidig: {EV_perc_current}%)",
+                    EV_perc_current, 100, EV_perc_current,
+                )
 
-            min_date = df_output["DATUM_TIJDSTIP_2024"].min().date()
-            max_date = df_output["DATUM_TIJDSTIP_2024"].max().date()
-            default_start = min_date
+                df_output = bg.profile_creator(profielen_df, msr_row, EV_adoption_perc, EV_jvb_per_auto)
+                df_output = bg.update_charge_strat(
+                    df_output, charge_strat_en, profielen_df, msr_row, EV_adoption_perc, EV_jvb_per_auto
+                )
 
-            if "min_max" in st.session_state:
+                if (st.session_state.original_peak_power is None
+                        or st.session_state.get("last_loaded_msr") != st.session_state.selected_id):
+                    st.session_state.original_peak_power = df_output["MSR totaal_base profile [kW]"].max()
+                    st.session_state.last_loaded_msr = st.session_state.selected_id
+
+                st.markdown("---")
+                st.markdown("**Dagselectie**")
+
+                if st.button("📈 Dag met hoogste piekvermogen"):
+                    st.session_state.date_max_power = df_output.loc[
+                        df_output["MSR totaal [kW]"].idxmax(), "DATUM_TIJDSTIP_2024"
+                    ]
+                    st.session_state.min_max = "max"
+
+                if st.button("📉 Dag met laagste piekvermogen"):
+                    st.session_state.date_min_power = df_output.loc[
+                        df_output["MSR totaal [kW]"].idxmin(), "DATUM_TIJDSTIP_2024"
+                    ]
+                    st.session_state.min_max = "min"
+
+                min_date = df_output["DATUM_TIJDSTIP_2024"].min().date()
+                max_date = df_output["DATUM_TIJDSTIP_2024"].max().date()
+                default_start = min_date
+
                 if st.session_state.min_max == "max" and "date_max_power" in st.session_state:
                     default_start = st.session_state.date_max_power
                 elif st.session_state.min_max == "min" and "date_min_power" in st.session_state:
                     default_start = st.session_state.date_min_power
 
-            if isinstance(default_start, pd.Timestamp):
-                default_start = default_start.date()
+                if isinstance(default_start, pd.Timestamp):
+                    default_start = default_start.date()
+                default_start = min(max(default_start, min_date), max_date)
 
-            default_start = min(max(default_start, min_date), max_date)
+                start_date = st.date_input("Startdatum", default_start, min_value=min_date, max_value=max_date)
+                end_date = st.date_input(
+                    "Einddatum",
+                    start_date + timedelta(days=1),
+                    min_value=start_date + timedelta(days=1),
+                    max_value=max_date,
+                )
 
-            start_date = st.date_input("Startdatum", default_start, min_value=min_date, max_value=max_date)
-            end_date = st.date_input("Einddatum", start_date + timedelta(days=1), min_value=start_date + timedelta(days=1), max_value=max_date)
-
-            date_range = (end_date - start_date).days
-
-            if "awaiting_confirmation" not in st.session_state:
-                st.session_state.awaiting_confirmation = False
-
-            if date_range <= 10:
-                bg.prepare_plot_df(start_date, end_date, df_output)
-            else:
-                if not st.session_state.awaiting_confirmation:
-                    st.warning(f"Je hebt een lange periode geselecteerd: {date_range} dagen.")
-                    st.info("Dit kan traag zijn. Wil je doorgaan?")
-                    if st.button("Ja, doorgaan"):
-                        st.session_state.awaiting_confirmation = True
-                    else:
-                        st.stop()
-                if st.session_state.awaiting_confirmation:
+                date_range = (end_date - start_date).days
+                if date_range <= 10:
                     bg.prepare_plot_df(start_date, end_date, df_output)
-                    st.session_state.awaiting_confirmation = False
+                else:
+                    if not st.session_state.awaiting_confirmation:
+                        st.warning(f"Geselecteerde periode: {date_range} dagen — dit kan traag zijn.")
+                        if st.button("Ja, doorgaan"):
+                            st.session_state.awaiting_confirmation = True
+                        else:
+                            st.stop()
+                    if st.session_state.awaiting_confirmation:
+                        bg.prepare_plot_df(start_date, end_date, df_output)
+                        st.session_state.awaiting_confirmation = False
 
-            plot_placeholder = st.empty()
+    # ------------------------------------------------------------------ #
+    #  Kolom 3 – Grafiek + KPIs                                           #
+    # ------------------------------------------------------------------ #
+    with col_chart:
+        with st.container(border=True):
+            if df_output is None:
+                return
 
-            if "df_plot_data" not in st.session_state:
-                st.session_state["df_plot_data"] = None
-
-            # Use original peak power for the red line
             original_peak = st.session_state.original_peak_power
-            
-            if st.session_state["df_plot_data"] is not None:
+
+            st.subheader("Vermogensprofiel")
+            if st.session_state.df_plot_data is not None:
                 bg.plot_df_with_dashed_lines(
-                    st.session_state["df_plot_data"], 
-                    plot_placeholder,
-                    max_base_profile=original_peak
+                    st.session_state.df_plot_data,
+                    st.empty(),
+                    max_base_profile=original_peak,
                 )
             else:
-                st.write("Nog geen grafiek gegenereerd.")
+                st.info("Selecteer een datumbereik om de grafiek te tonen.")
 
-            st.subheader("KPI's:")
-            
+            st.markdown("---")
+            st.subheader("KPI's")
+
             num_autos = int(msr_row["aantal_personenautos_msr"].iloc[0])
-            
-            # Only show number of cars KPI
             st.markdown(f"""
-            <div style='background-color: #f0f2f6; padding: 15px; border-radius: 10px; margin-bottom: 10px;'>
-                <p style='color: #666; font-size: 14px; margin: 0;'>Aantal auto's (waarvan {EV_adoption_perc}% EV)</p>
-                <p style='color: #1f77b4; font-size: 28px; font-weight: bold; margin: 5px 0;'>{num_autos:,}</p>
+            <div style='background-color:#f0f2f6;padding:12px;border-radius:8px;margin-bottom:12px;'>
+                <p style='color:#666;font-size:13px;margin:0;'>Aantal auto's (waarvan {EV_adoption_perc}% EV)</p>
+                <p style='color:#1f77b4;font-size:26px;font-weight:bold;margin:4px 0;'>{num_autos:,}</p>
             </div>
             """, unsafe_allow_html=True)
-            
-            peak_on_demand = df_output["MSR totaal_base profile [kW]"].max()
-            
+
             if charge_strat != "Regulier on-demand laden":
-                peak_selected_profile = df_output["MSR totaal [kW]"].max()
-                PAR_on_demand = df_output["MSR totaal_base profile [kW]"].max()/df_output["MSR totaal_base profile [kW]"].mean()
-                PAR_selected_profile = df_output["MSR totaal [kW]"].max()/df_output["MSR totaal [kW]"].mean()
-                peak_reduction = original_peak - peak_selected_profile
-                par_difference = PAR_on_demand - PAR_selected_profile
+                peak_selected = df_output["MSR totaal [kW]"].max()
+                PAR_base = (df_output["MSR totaal_base profile [kW]"].max()
+                            / df_output["MSR totaal_base profile [kW]"].mean())
+                PAR_selected = df_output["MSR totaal [kW]"].max() / df_output["MSR totaal [kW]"].mean()
+                peak_reduction = original_peak - peak_selected
 
                 st.markdown("**Piekvermogen**")
-                kpi_col1, kpi_col2, kpi_col3 = st.columns(3)
-                
-                with kpi_col1:
-                    st.markdown(f"""
-                    <div style='background-color: #fff3cd; padding: 15px; border-radius: 10px; border-left: 4px solid #ffc107;'>
-                        <p style='color: #666; font-size: 12px; margin: 0;'>On-demand laden (origineel)</p>
-                        <p style='color: #333; font-size: 24px; font-weight: bold; margin: 5px 0;'>{int(original_peak):,} kW</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with kpi_col2:
-                    st.markdown(f"""
-                    <div style='background-color: #d1ecf1; padding: 15px; border-radius: 10px; border-left: 4px solid #17a2b8;'>
-                        <p style='color: #666; font-size: 12px; margin: 0;'>Geselecteerd profiel</p>
-                        <p style='color: #333; font-size: 24px; font-weight: bold; margin: 5px 0;'>{int(peak_selected_profile):,} kW</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with kpi_col3:
-                    st.markdown(f"""
-                    <div style='background-color: #d4edda; padding: 15px; border-radius: 10px; border-left: 4px solid #28a745;'>
-                        <p style='color: #666; font-size: 12px; margin: 0;'>Piekreductie</p>
-                        <p style='color: #28a745; font-size: 24px; font-weight: bold; margin: 5px 0;'>{int(peak_reduction):,} kW</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                st.markdown("")
-                
+                k1, k2, k3 = st.columns(3)
+                k1.markdown(f"""<div style='background:#fff3cd;padding:12px;border-radius:8px;border-left:4px solid #ffc107;'>
+                    <p style='color:#666;font-size:11px;margin:0;'>On-demand (origineel)</p>
+                    <p style='color:#333;font-size:20px;font-weight:bold;margin:4px 0;'>{int(original_peak):,} kW</p></div>""",
+                    unsafe_allow_html=True)
+                k2.markdown(f"""<div style='background:#d1ecf1;padding:12px;border-radius:8px;border-left:4px solid #17a2b8;'>
+                    <p style='color:#666;font-size:11px;margin:0;'>Geselecteerd profiel</p>
+                    <p style='color:#333;font-size:20px;font-weight:bold;margin:4px 0;'>{int(peak_selected):,} kW</p></div>""",
+                    unsafe_allow_html=True)
+                k3.markdown(f"""<div style='background:#d4edda;padding:12px;border-radius:8px;border-left:4px solid #28a745;'>
+                    <p style='color:#666;font-size:11px;margin:0;'>Piekreductie</p>
+                    <p style='color:#28a745;font-size:20px;font-weight:bold;margin:4px 0;'>{int(peak_reduction):,} kW</p></div>""",
+                    unsafe_allow_html=True)
+
                 st.markdown("**Peak-to-Average Ratio**")
-                kpi_col1, kpi_col2, kpi_col3 = st.columns(3)
-                
-                with kpi_col1:
-                    st.markdown(f"""
-                    <div style='background-color: #fff3cd; padding: 15px; border-radius: 10px; border-left: 4px solid #ffc107;'>
-                        <p style='color: #666; font-size: 12px; margin: 0;'>On-demand laden</p>
-                        <p style='color: #333; font-size: 24px; font-weight: bold; margin: 5px 0;'>{round(PAR_on_demand, 2)}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with kpi_col2:
-                    st.markdown(f"""
-                    <div style='background-color: #d1ecf1; padding: 15px; border-radius: 10px; border-left: 4px solid #17a2b8;'>
-                        <p style='color: #666; font-size: 12px; margin: 0;'>Geselecteerd profiel</p>
-                        <p style='color: #333; font-size: 24px; font-weight: bold; margin: 5px 0;'>{round(PAR_selected_profile, 2)}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with kpi_col3:
-                    st.markdown(f"""
-                    <div style='background-color: #d4edda; padding: 15px; border-radius: 10px; border-left: 4px solid #28a745;'>
-                        <p style='color: #666; font-size: 12px; margin: 0;'>Verschil</p>
-                        <p style='color: #28a745; font-size: 24px; font-weight: bold; margin: 5px 0;'>{round(par_difference, 2)}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-
+                k1, k2, k3 = st.columns(3)
+                k1.markdown(f"""<div style='background:#fff3cd;padding:12px;border-radius:8px;border-left:4px solid #ffc107;'>
+                    <p style='color:#666;font-size:11px;margin:0;'>On-demand laden</p>
+                    <p style='color:#333;font-size:20px;font-weight:bold;margin:4px 0;'>{round(PAR_base, 2)}</p></div>""",
+                    unsafe_allow_html=True)
+                k2.markdown(f"""<div style='background:#d1ecf1;padding:12px;border-radius:8px;border-left:4px solid #17a2b8;'>
+                    <p style='color:#666;font-size:11px;margin:0;'>Geselecteerd profiel</p>
+                    <p style='color:#333;font-size:20px;font-weight:bold;margin:4px 0;'>{round(PAR_selected, 2)}</p></div>""",
+                    unsafe_allow_html=True)
+                k3.markdown(f"""<div style='background:#d4edda;padding:12px;border-radius:8px;border-left:4px solid #28a745;'>
+                    <p style='color:#666;font-size:11px;margin:0;'>Verschil</p>
+                    <p style='color:#28a745;font-size:20px;font-weight:bold;margin:4px 0;'>{round(PAR_base - PAR_selected, 2)}</p></div>""",
+                    unsafe_allow_html=True)
             else:
-                PAR_on_demand = df_output["MSR totaal_base profile [kW]"].max()/df_output["MSR totaal_base profile [kW]"].mean()
+                PAR_base = (df_output["MSR totaal_base profile [kW]"].max()
+                            / df_output["MSR totaal_base profile [kW]"].mean())
+                k1, k2 = st.columns(2)
+                k1.markdown(f"""<div style='background:#fff3cd;padding:14px;border-radius:8px;border-left:4px solid #ffc107;'>
+                    <p style='color:#666;font-size:13px;margin:0;'>Piekvermogen (on-demand)</p>
+                    <p style='color:#333;font-size:26px;font-weight:bold;margin:4px 0;'>{int(original_peak):,} kW</p></div>""",
+                    unsafe_allow_html=True)
+                k2.markdown(f"""<div style='background:#d1ecf1;padding:14px;border-radius:8px;border-left:4px solid #17a2b8;'>
+                    <p style='color:#666;font-size:13px;margin:0;'>Peak-to-Average Ratio</p>
+                    <p style='color:#333;font-size:26px;font-weight:bold;margin:4px 0;'>{round(PAR_base, 2)}</p></div>""",
+                    unsafe_allow_html=True)
 
-                kpi_col1, kpi_col2 = st.columns(2)
-                
-                with kpi_col1:
-                    st.markdown(f"""
-                    <div style='background-color: #fff3cd; padding: 20px; border-radius: 10px; border-left: 4px solid #ffc107;'>
-                        <p style='color: #666; font-size: 14px; margin: 0;'>Piekvermogen (on-demand)</p>
-                        <p style='color: #333; font-size: 32px; font-weight: bold; margin: 5px 0;'>{int(original_peak):,} kW</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with kpi_col2:
-                    st.markdown(f"""
-                    <div style='background-color: #d1ecf1; padding: 20px; border-radius: 10px; border-left: 4px solid #17a2b8;'>
-                        <p style='color: #666; font-size: 14px; margin: 0;'>Peak-to-Average Ratio</p>
-                        <p style='color: #333; font-size: 32px; font-weight: bold; margin: 5px 0;'>{round(PAR_on_demand, 2)}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
 
-    else:
-        st.info("👈 Klik op een MSR punt op de kaart om hier details te zien.")
+# --- Hoofd-layout: drie visuele kolommen ---
+col_map, col_right = st.columns([1, 2.4], gap="medium")
+
+with col_map:
+    with st.container(border=True):
+        render_map_panel()
+
+with col_right:
+    render_analysis_panel()
