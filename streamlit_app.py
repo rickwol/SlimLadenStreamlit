@@ -10,7 +10,8 @@ from datetime import timedelta, datetime
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut
 
-st.set_page_config(layout="wide")
+st.set_page_config(layout="wide", page_title="Slim Laden Impact",
+                   page_icon=":electric_plug:")
 
 st.markdown("""
 <style>
