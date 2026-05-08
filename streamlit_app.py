@@ -151,6 +151,76 @@ def get_msr_points(_msr_gdf):
     })
 
 
+@st.cache_data
+def load_price_data():
+    """Load Prijzen2024Geheel.csv and return deduplicated hourly price DataFrame.
+
+    The CSV has tz-aware timestamps (e.g. +01:00). We strip the timezone by
+    formatting each timestamp as its local-time string and re-parsing as tz-naive,
+    so the result matches the tz-naive MSR profile timestamps without needing pytz.
+    """
+    try:
+        df = pd.read_csv("Prijzen2024Geheel.csv", index_col=0)
+        ts = pd.to_datetime(df["DATUM_TIJDSTIP_2024"])
+        # strftime on tz-aware Series formats in the timezone of each timestamp
+        # (local Amsterdam time) → re-parse as tz-naive to match MSR profile
+        df["DATUM_TIJDSTIP_2024"] = pd.to_datetime(ts.dt.strftime("%Y-%m-%d %H:%M:%S"))
+        # CSV has 4 identical rows per hour; keep one per unique timestamp
+        df = df.drop_duplicates(subset="DATUM_TIJDSTIP_2024", keep="first").reset_index(drop=True)
+        return df
+    except Exception as e:
+        st.session_state["_price_load_error"] = str(e)
+        return None
+
+
+def prepare_price_for_merge(price_df, msr_df):
+    """Align hourly price data to the 15-min MSR timestamps via hour-floor join."""
+    msr_ts = pd.to_datetime(msr_df["DATUM_TIJDSTIP_2024"])
+    lookup = pd.DataFrame({
+        "DATUM_TIJDSTIP_2024": msr_df["DATUM_TIJDSTIP_2024"].values,
+        "hour_ts": msr_ts.dt.floor("h").values,
+    })
+    price_copy = price_df.rename(columns={"DATUM_TIJDSTIP_2024": "hour_ts"})
+    aligned = lookup.merge(price_copy[["hour_ts", "price_eur_per_kwh"]], on="hour_ts", how="left")
+    aligned["price_eur_per_kwh"] = aligned["price_eur_per_kwh"].fillna(
+        aligned["price_eur_per_kwh"].mean()
+    )
+    return aligned[["DATUM_TIJDSTIP_2024", "price_eur_per_kwh"]]
+
+
+def _store_plot_data(start_date, end_date, df_output, df_bat=None):
+    """Build and store the complete plot DataFrame in one step.
+
+    Uses df_output for the five base series and optionally joins battery columns
+    from df_bat on the shared DatetimeIndex.  Using join() instead of concat()
+    avoids the alignment issues that can occur with a two-step approach.
+    """
+    _BASE_COLS = [
+        "Woningen totaal [kW]",
+        "Utiliteit totaal [kW]",
+        "Zonnepanelen [kW]",
+        "EV oplaad [kW]",
+        "MSR totaal [kW]",
+    ]
+    mask = (
+        (df_output["DATUM_TIJDSTIP_2024"] >= pd.to_datetime(start_date))
+        & (df_output["DATUM_TIJDSTIP_2024"] <= pd.to_datetime(end_date))
+    )
+    result = df_output.loc[mask].set_index("DATUM_TIJDSTIP_2024")[_BASE_COLS].copy()
+
+    if df_bat is not None:
+        bat_mask = (
+            (df_bat["DATUM_TIJDSTIP_2024"] >= pd.to_datetime(start_date))
+            & (df_bat["DATUM_TIJDSTIP_2024"] <= pd.to_datetime(end_date))
+        )
+        bat_slice = df_bat.loc[bat_mask].set_index("DATUM_TIJDSTIP_2024")[
+            ["MSR totaal met batterij [kW]", "Batterij vermogen [kW]"]
+        ]
+        result = result.join(bat_slice, how="left")
+
+    st.session_state["df_plot_data"] = result
+
+
 def build_buildings_layer(cached_df, selected_id):
     """Parse WKB building geometries and return a red PyDeck ScatterplotLayer.
 
@@ -306,7 +376,7 @@ def render_map_panel():
             st.session_state.map_center = [selected_objects[0]["lat"], selected_objects[0]["lon"]]
             st.session_state.map_zoom = 14
             st.session_state.selected_id = new_id
-            st.session_state.cached_df = bg.load_room_objects2(new_id, "datamichael13april26")
+            st.session_state.cached_df = bg.load_room_objects2(new_id, "datamichael06mei26")
             st.session_state.last_msr_id = new_id
             st.session_state.original_peak_power = None
             st.session_state.df_plot_data = None
@@ -320,234 +390,320 @@ def render_map_panel():
 
 @st.fragment
 def render_analysis_panel():
-    """Kolom 2 (inputs) + kolom 3 (grafiek & KPIs) als één fragment.
-
-    Eén fragment zodat wijzigingen in de inputs direct de grafiek updaten
-    zonder de kaart opnieuw te renderen.
-    """
-    col_inputs, col_chart = st.columns([1, 1.4], gap="medium")
-
-    if not st.session_state.selected_id:
-        with col_inputs:
-            with st.container(border=True):
-                st.info("👈 Klik op een MSR punt op de kaart om hier details te zien.")
-        return
-
-    msr_row = st.session_state.cached_df
+    """Kolom 2: MSR-naam + invoer. Kolom 3: grafiek + KPIs."""
     EV_jvb_per_auto = 3500
+    df_output = None
+    df_with_battery = None
+    charge_strat = "Regulier on-demand laden"
+    EV_adoption_perc = 0
+    battery_enabled = False
+    battery_kwh_val = 200
+    battery_strategy = "peak_reduction"
+
+    col_inputs, col_chart = st.columns([1, 1.5], gap="medium")
 
     # ------------------------------------------------------------------ #
-    #  Kolom 2 – MSR-naam + alle invoer                                   #
+    #  Kolom 2 – MSR-naam en invoerwidgets                                #
     # ------------------------------------------------------------------ #
     with col_inputs:
         with st.container(border=True):
+            if not st.session_state.selected_id:
+                st.info("👈 Klik op een MSR op de kaart.")
+            else:
+                msr_row = st.session_state.cached_df
 
-            # MSR header
-            try:
-                norm_id = normalize_msr_id(st.session_state.selected_id)
-                selected_msr = msr_gdf[msr_gdf['owner_msr'].apply(normalize_msr_id) == norm_id]
-                if len(selected_msr) > 0:
-                    msr_wgs84 = selected_msr.to_crs(epsg=4326)
-                    geom = msr_wgs84.geometry.iloc[0]
-                    if geom is not None and not geom.is_empty:
-                        msr_lat, msr_lon = geom.y, geom.x
-                        msr_address = get_address_from_coords(msr_lat, msr_lon)
-                        if msr_address:
-                            st.subheader(f"MSR: {msr_address}")
-                            st.caption(f"ID: {norm_id} | {msr_lat:.4f}, {msr_lon:.4f}")
+                # MSR-naam / adres
+                try:
+                    norm_id = normalize_msr_id(st.session_state.selected_id)
+                    selected_msr = msr_gdf[msr_gdf['owner_msr'].apply(normalize_msr_id) == norm_id]
+                    if len(selected_msr) > 0:
+                        msr_wgs84 = selected_msr.to_crs(epsg=4326)
+                        geom = msr_wgs84.geometry.iloc[0]
+                        if geom is not None and not geom.is_empty:
+                            msr_lat, msr_lon = geom.y, geom.x
+                            msr_address = get_address_from_coords(msr_lat, msr_lon)
+                            if msr_address:
+                                st.subheader(f"MSR: {msr_address}")
+                                st.caption(f"ID: {norm_id} | {msr_lat:.4f}, {msr_lon:.4f}")
+                            else:
+                                st.subheader(f"MSR: {norm_id}")
+                                st.caption(f"Coördinaten: {msr_lat:.4f}, {msr_lon:.4f}")
                         else:
                             st.subheader(f"MSR: {norm_id}")
-                            st.caption(f"Coördinaten: {msr_lat:.4f}, {msr_lon:.4f}")
                     else:
-                        st.subheader(f"MSR: {norm_id}")
-                else:
-                    st.subheader(f"MSR: {st.session_state.selected_id}")
-            except Exception as e:
-                st.subheader(f"MSR: {st.session_state.selected_id}")
-                st.caption(f"(Adres kon niet worden opgehaald: {e})")
-
-            if len(msr_row) == 0:
-                st.warning("Geen data beschikbaar voor dit MSR.")
-                # Zet lege waarden zodat kolom 3 veilig kan renderen
-                charge_strat = "Regulier on-demand laden"
-                EV_adoption_perc = 0
-                df_output = None
-                start_date = end_date = None
-            else:
-                st.markdown("---")
-
-                charge_strat = st.selectbox(
-                    "Laadstrategie",
-                    ("Regulier on-demand laden", "Netbewust slim laden", "Capaciteitspooling", "V2G"),
-                    key="charge_strategy",
-                )
-                charge_strat_en = {
-                    "Regulier on-demand laden": "Regular on-demand charging",
-                    "Netbewust slim laden": "Grid-aware smart charging",
-                    "Capaciteitspooling": "Capacity pooling",
-                    "V2G": "V2G",
-                }[charge_strat]
-
-                try:
-                    if "aantal_evs_m_msr" in msr_row.columns and "aantal_personenautos_msr" in msr_row.columns:
-                        num_evs = msr_row["aantal_evs_m_msr"].iloc[0]
-                        num_cars = msr_row["aantal_personenautos_msr"].iloc[0]
-                        EV_perc_current = int(num_evs * 100 / num_cars) if num_cars > 0 else 0
-                    else:
-                        EV_perc_current = 25
-                        st.info("⚠️ EV data niet beschikbaar, standaard 25% wordt gebruikt")
+                        st.subheader(f"MSR: {st.session_state.selected_id}")
                 except Exception as e:
-                    EV_perc_current = 25
-                    st.warning(f"Fout bij EV percentage: {e}. Standaard 25% wordt gebruikt.")
-
-                EV_adoption_perc = st.slider(
-                    f"EV-adoptie percentage (huidig: {EV_perc_current}%)",
-                    EV_perc_current, 100, EV_perc_current,
-                )
-
-                df_output = bg.profile_creator(profielen_df, msr_row, EV_adoption_perc, EV_jvb_per_auto)
-                df_output = bg.update_charge_strat(
-                    df_output, charge_strat_en, profielen_df, msr_row, EV_adoption_perc, EV_jvb_per_auto
-                )
-
-                if (st.session_state.original_peak_power is None
-                        or st.session_state.get("last_loaded_msr") != st.session_state.selected_id):
-                    st.session_state.original_peak_power = df_output["MSR totaal_base profile [kW]"].max()
-                    st.session_state.last_loaded_msr = st.session_state.selected_id
+                    st.subheader(f"MSR: {st.session_state.selected_id}")
+                    st.caption(f"(Adres kon niet worden opgehaald: {e})")
 
                 st.markdown("---")
-                st.markdown("**Dagselectie**")
 
-                if st.button("📈 Dag met hoogste piekvermogen"):
-                    st.session_state.date_max_power = df_output.loc[
-                        df_output["MSR totaal [kW]"].idxmax(), "DATUM_TIJDSTIP_2024"
-                    ]
-                    st.session_state.min_max = "max"
-
-                if st.button("📉 Dag met laagste piekvermogen"):
-                    st.session_state.date_min_power = df_output.loc[
-                        df_output["MSR totaal [kW]"].idxmin(), "DATUM_TIJDSTIP_2024"
-                    ]
-                    st.session_state.min_max = "min"
-
-                min_date = df_output["DATUM_TIJDSTIP_2024"].min().date()
-                max_date = df_output["DATUM_TIJDSTIP_2024"].max().date()
-                default_start = min_date
-
-                if st.session_state.min_max == "max" and "date_max_power" in st.session_state:
-                    default_start = st.session_state.date_max_power
-                elif st.session_state.min_max == "min" and "date_min_power" in st.session_state:
-                    default_start = st.session_state.date_min_power
-
-                if isinstance(default_start, pd.Timestamp):
-                    default_start = default_start.date()
-                default_start = min(max(default_start, min_date), max_date)
-
-                start_date = st.date_input("Startdatum", default_start, min_value=min_date, max_value=max_date)
-                end_date = st.date_input(
-                    "Einddatum",
-                    start_date + timedelta(days=1),
-                    min_value=start_date + timedelta(days=1),
-                    max_value=max_date,
-                )
-
-                date_range = (end_date - start_date).days
-                if date_range <= 10:
-                    bg.prepare_plot_df(start_date, end_date, df_output)
+                if len(msr_row) == 0:
+                    st.warning("Geen data beschikbaar voor dit MSR.")
                 else:
-                    if not st.session_state.awaiting_confirmation:
-                        st.warning(f"Geselecteerde periode: {date_range} dagen — dit kan traag zijn.")
+                    charge_strat = st.selectbox(
+                        "Laadstrategie",
+                        ("Regulier on-demand laden", "Netbewust slim laden", "Capaciteitspooling", "V2G"),
+                        key="charge_strategy",
+                    )
+                    charge_strat_en = {
+                        "Regulier on-demand laden": "Regular on-demand charging",
+                        "Netbewust slim laden": "Grid-aware smart charging",
+                        "Capaciteitspooling": "Capacity pooling",
+                        "V2G": "V2G",
+                    }[charge_strat]
+
+                    try:
+                        if "aantal_evs_m_msr" in msr_row.columns and "aantal_personenautos_msr" in msr_row.columns:
+                            num_evs = msr_row["aantal_evs_m_msr"].iloc[0]
+                            num_cars = msr_row["aantal_personenautos_msr"].iloc[0]
+                            EV_perc_current = int(num_evs * 100 / num_cars) if num_cars > 0 else 0
+                        else:
+                            EV_perc_current = 25
+                            st.info("⚠️ EV data niet beschikbaar, standaard 25%")
+                    except Exception as e:
+                        EV_perc_current = 25
+                        st.warning(f"Fout bij EV%: {e}")
+
+                    EV_adoption_perc = st.slider(
+                        f"EV-adoptie (huidig: {EV_perc_current}%)",
+                        EV_perc_current, 100, EV_perc_current,
+                    )
+
+                    df_output = bg.profile_creator(profielen_df, msr_row, EV_adoption_perc, EV_jvb_per_auto)
+                    df_output = bg.update_charge_strat(
+                        df_output, charge_strat_en, profielen_df, msr_row, EV_adoption_perc, EV_jvb_per_auto
+                    )
+
+                    if (st.session_state.original_peak_power is None
+                            or st.session_state.get("last_loaded_msr") != st.session_state.selected_id):
+                        st.session_state.original_peak_power = df_output["MSR totaal_base profile [kW]"].max()
+                        st.session_state.last_loaded_msr = st.session_state.selected_id
+
+                    st.markdown("---")
+                    st.markdown("**Dagselectie**")
+
+                    if st.button("📈 Hoogste piekvermogen"):
+                        st.session_state.date_max_power = df_output.loc[
+                            df_output["MSR totaal [kW]"].idxmax(), "DATUM_TIJDSTIP_2024"
+                        ]
+                        st.session_state.min_max = "max"
+
+                    if st.button("📉 Laagste piekvermogen"):
+                        st.session_state.date_min_power = df_output.loc[
+                            df_output["MSR totaal [kW]"].idxmin(), "DATUM_TIJDSTIP_2024"
+                        ]
+                        st.session_state.min_max = "min"
+
+                    min_date = df_output["DATUM_TIJDSTIP_2024"].min().date()
+                    max_date = df_output["DATUM_TIJDSTIP_2024"].max().date()
+                    default_start = min_date
+
+                    if st.session_state.min_max == "max" and "date_max_power" in st.session_state:
+                        default_start = st.session_state.date_max_power
+                    elif st.session_state.min_max == "min" and "date_min_power" in st.session_state:
+                        default_start = st.session_state.date_min_power
+
+                    if isinstance(default_start, pd.Timestamp):
+                        default_start = default_start.date()
+                    default_start = min(max(default_start, min_date), max_date)
+
+                    start_date = st.date_input("Startdatum", default_start, min_value=min_date, max_value=max_date)
+                    end_date = st.date_input(
+                        "Einddatum",
+                        start_date + timedelta(days=1),
+                        min_value=start_date + timedelta(days=1),
+                        max_value=max_date,
+                    )
+
+                    st.markdown("---")
+                    st.markdown("**🔋 Batterijopslag**")
+
+                    battery_enabled = st.checkbox("Batterij inschakelen", key="battery_enabled")
+                    if battery_enabled:
+                        _STRATEGY_LABELS = {
+                            "self_consumption": "Zelf benutting zonnestroom",
+                            "price_optimization": "Prijsoptimalisatie",
+                            "peak_reduction": "Piekvermindering",
+                        }
+                        battery_strategy = st.selectbox(
+                            "Batterijstrategie",
+                            list(_STRATEGY_LABELS.keys()),
+                            format_func=lambda x: _STRATEGY_LABELS[x],
+                            key="battery_strategy",
+                        )
+                        battery_kwh_val = st.slider(
+                            "Batterijcapaciteit (kWh)", 50, 1000, 200, step=50, key="battery_kwh"
+                        )
+
+                        price_for_bat = None
+                        if battery_strategy == "price_optimization":
+                            raw_prices = load_price_data()
+                            if raw_prices is None:
+                                err = st.session_state.get("_price_load_error", "onbekende fout")
+                                st.warning(f"⚠️ Prijsdata kon niet worden geladen: {err}")
+                                battery_enabled = False
+                            else:
+                                price_for_bat = prepare_price_for_merge(raw_prices, df_output)
+
+                        if battery_enabled:
+                            with st.spinner("Batterijsimulatie berekenen..."):
+                                try:
+                                    df_with_battery = bg.battery_optimizer(
+                                        df_output, battery_strategy, battery_kwh_val, price_for_bat
+                                    )
+                                except Exception as e:
+                                    st.warning(f"⚠️ Batterijberekening mislukt: {e}")
+                                    battery_enabled = False
+
+                    _bat_for_plot = df_with_battery if battery_enabled else None
+                    date_range = (end_date - start_date).days
+                    if date_range <= 10:
+                        _store_plot_data(start_date, end_date, df_output, _bat_for_plot)
+                    elif st.session_state.awaiting_confirmation:
+                        _store_plot_data(start_date, end_date, df_output, _bat_for_plot)
+                        st.session_state.awaiting_confirmation = False
+                    else:
+                        st.warning(f"Periode: {date_range} dagen — kan traag zijn.")
                         if st.button("Ja, doorgaan"):
                             st.session_state.awaiting_confirmation = True
-                        else:
-                            st.stop()
-                    if st.session_state.awaiting_confirmation:
-                        bg.prepare_plot_df(start_date, end_date, df_output)
-                        st.session_state.awaiting_confirmation = False
 
     # ------------------------------------------------------------------ #
-    #  Kolom 3 – Grafiek + KPIs                                           #
+    #  Kolom 3 – grafiek en KPIs                                          #
     # ------------------------------------------------------------------ #
     with col_chart:
         with st.container(border=True):
-            if df_output is None:
-                return
-
-            original_peak = st.session_state.original_peak_power
-
-            st.subheader("Vermogensprofiel")
-            if st.session_state.df_plot_data is not None:
-                bg.plot_df_with_dashed_lines(
-                    st.session_state.df_plot_data,
-                    st.empty(),
-                    max_base_profile=original_peak,
-                )
+            if not st.session_state.selected_id or df_output is None:
+                st.info("Selecteer een MSR en datumbereik om de grafiek te tonen.")
             else:
-                st.info("Selecteer een datumbereik om de grafiek te tonen.")
+                msr_row = st.session_state.cached_df
+                original_peak = st.session_state.original_peak_power
 
-            st.markdown("---")
-            st.subheader("KPI's")
+                if st.session_state.df_plot_data is not None:
+                    # Batterij vermogen als gestippelde lijn zodat het visueel onderscheiden is
+                    dashed = [
+                        "EV oplaad [kW]",
+                        "Utiliteit totaal [kW]",
+                        "Woningen totaal [kW]",
+                        "Zonnepanelen [kW]",
+                        "Batterij vermogen [kW]",
+                    ]
+                    bg.plot_df_with_dashed_lines(
+                        st.session_state.df_plot_data,
+                        st.empty(),
+                        dashed_series=dashed,
+                        max_base_profile=original_peak,
+                    )
+                else:
+                    st.info("Selecteer een datumbereik om de grafiek te tonen.")
 
-            num_autos = int(msr_row["aantal_personenautos_msr"].iloc[0])
-            st.markdown(f"""
-            <div style='background-color:#f0f2f6;padding:12px;border-radius:8px;margin-bottom:12px;'>
-                <p style='color:#666;font-size:13px;margin:0;'>Aantal auto's (waarvan {EV_adoption_perc}% EV)</p>
-                <p style='color:#1f77b4;font-size:26px;font-weight:bold;margin:4px 0;'>{num_autos:,}</p>
-            </div>
-            """, unsafe_allow_html=True)
+                st.markdown("---")
+                st.subheader("KPI's")
 
-            if charge_strat != "Regulier on-demand laden":
-                peak_selected = df_output["MSR totaal [kW]"].max()
-                PAR_base = (df_output["MSR totaal_base profile [kW]"].max()
-                            / df_output["MSR totaal_base profile [kW]"].mean())
-                PAR_selected = df_output["MSR totaal [kW]"].max() / df_output["MSR totaal [kW]"].mean()
-                peak_reduction = original_peak - peak_selected
+                num_autos = int(msr_row["aantal_personenautos_msr"].iloc[0])
+                st.markdown(f"""
+                <div style='background-color:#f0f2f6;padding:12px;border-radius:8px;margin-bottom:12px;'>
+                    <p style='color:#666;font-size:13px;margin:0;'>Aantal auto's (waarvan {EV_adoption_perc}% EV)</p>
+                    <p style='color:#1f77b4;font-size:26px;font-weight:bold;margin:4px 0;'>{num_autos:,}</p>
+                </div>
+                """, unsafe_allow_html=True)
 
-                st.markdown("**Piekvermogen**")
-                k1, k2, k3 = st.columns(3)
-                k1.markdown(f"""<div style='background:#fff3cd;padding:12px;border-radius:8px;border-left:4px solid #ffc107;'>
-                    <p style='color:#666;font-size:11px;margin:0;'>On-demand (origineel)</p>
-                    <p style='color:#333;font-size:20px;font-weight:bold;margin:4px 0;'>{int(original_peak):,} kW</p></div>""",
-                    unsafe_allow_html=True)
-                k2.markdown(f"""<div style='background:#d1ecf1;padding:12px;border-radius:8px;border-left:4px solid #17a2b8;'>
-                    <p style='color:#666;font-size:11px;margin:0;'>Geselecteerd profiel</p>
-                    <p style='color:#333;font-size:20px;font-weight:bold;margin:4px 0;'>{int(peak_selected):,} kW</p></div>""",
-                    unsafe_allow_html=True)
-                k3.markdown(f"""<div style='background:#d4edda;padding:12px;border-radius:8px;border-left:4px solid #28a745;'>
-                    <p style='color:#666;font-size:11px;margin:0;'>Piekreductie</p>
-                    <p style='color:#28a745;font-size:20px;font-weight:bold;margin:4px 0;'>{int(peak_reduction):,} kW</p></div>""",
-                    unsafe_allow_html=True)
+                if charge_strat != "Regulier on-demand laden":
+                    peak_selected = df_output["MSR totaal [kW]"].max()
+                    PAR_base = (df_output["MSR totaal_base profile [kW]"].max()
+                                / df_output["MSR totaal_base profile [kW]"].mean())
+                    PAR_selected = df_output["MSR totaal [kW]"].max() / df_output["MSR totaal [kW]"].mean()
+                    peak_reduction = original_peak - peak_selected
 
-                st.markdown("**Peak-to-Average Ratio**")
-                k1, k2, k3 = st.columns(3)
-                k1.markdown(f"""<div style='background:#fff3cd;padding:12px;border-radius:8px;border-left:4px solid #ffc107;'>
-                    <p style='color:#666;font-size:11px;margin:0;'>On-demand laden</p>
-                    <p style='color:#333;font-size:20px;font-weight:bold;margin:4px 0;'>{round(PAR_base, 2)}</p></div>""",
-                    unsafe_allow_html=True)
-                k2.markdown(f"""<div style='background:#d1ecf1;padding:12px;border-radius:8px;border-left:4px solid #17a2b8;'>
-                    <p style='color:#666;font-size:11px;margin:0;'>Geselecteerd profiel</p>
-                    <p style='color:#333;font-size:20px;font-weight:bold;margin:4px 0;'>{round(PAR_selected, 2)}</p></div>""",
-                    unsafe_allow_html=True)
-                k3.markdown(f"""<div style='background:#d4edda;padding:12px;border-radius:8px;border-left:4px solid #28a745;'>
-                    <p style='color:#666;font-size:11px;margin:0;'>Verschil</p>
-                    <p style='color:#28a745;font-size:20px;font-weight:bold;margin:4px 0;'>{round(PAR_base - PAR_selected, 2)}</p></div>""",
-                    unsafe_allow_html=True)
-            else:
-                PAR_base = (df_output["MSR totaal_base profile [kW]"].max()
-                            / df_output["MSR totaal_base profile [kW]"].mean())
-                k1, k2 = st.columns(2)
-                k1.markdown(f"""<div style='background:#fff3cd;padding:14px;border-radius:8px;border-left:4px solid #ffc107;'>
-                    <p style='color:#666;font-size:13px;margin:0;'>Piekvermogen (on-demand)</p>
-                    <p style='color:#333;font-size:26px;font-weight:bold;margin:4px 0;'>{int(original_peak):,} kW</p></div>""",
-                    unsafe_allow_html=True)
-                k2.markdown(f"""<div style='background:#d1ecf1;padding:14px;border-radius:8px;border-left:4px solid #17a2b8;'>
-                    <p style='color:#666;font-size:13px;margin:0;'>Peak-to-Average Ratio</p>
-                    <p style='color:#333;font-size:26px;font-weight:bold;margin:4px 0;'>{round(PAR_base, 2)}</p></div>""",
-                    unsafe_allow_html=True)
+                    st.markdown("**Piekvermogen**")
+                    k1, k2, k3 = st.columns(3)
+                    k1.markdown(f"""<div style='background:#fff3cd;padding:12px;border-radius:8px;border-left:4px solid #ffc107;'>
+                        <p style='color:#666;font-size:11px;margin:0;'>On-demand (origineel)</p>
+                        <p style='color:#333;font-size:20px;font-weight:bold;margin:4px 0;'>{int(original_peak):,} kW</p></div>""",
+                        unsafe_allow_html=True)
+                    k2.markdown(f"""<div style='background:#d1ecf1;padding:12px;border-radius:8px;border-left:4px solid #17a2b8;'>
+                        <p style='color:#666;font-size:11px;margin:0;'>Geselecteerd profiel</p>
+                        <p style='color:#333;font-size:20px;font-weight:bold;margin:4px 0;'>{int(peak_selected):,} kW</p></div>""",
+                        unsafe_allow_html=True)
+                    k3.markdown(f"""<div style='background:#d4edda;padding:12px;border-radius:8px;border-left:4px solid #28a745;'>
+                        <p style='color:#666;font-size:11px;margin:0;'>Piekreductie</p>
+                        <p style='color:#28a745;font-size:20px;font-weight:bold;margin:4px 0;'>{int(peak_reduction):,} kW</p></div>""",
+                        unsafe_allow_html=True)
+
+                    st.markdown("**Peak-to-Average Ratio**")
+                    k1, k2, k3 = st.columns(3)
+                    k1.markdown(f"""<div style='background:#fff3cd;padding:12px;border-radius:8px;border-left:4px solid #ffc107;'>
+                        <p style='color:#666;font-size:11px;margin:0;'>On-demand laden</p>
+                        <p style='color:#333;font-size:20px;font-weight:bold;margin:4px 0;'>{round(PAR_base, 2)}</p></div>""",
+                        unsafe_allow_html=True)
+                    k2.markdown(f"""<div style='background:#d1ecf1;padding:12px;border-radius:8px;border-left:4px solid #17a2b8;'>
+                        <p style='color:#666;font-size:11px;margin:0;'>Geselecteerd profiel</p>
+                        <p style='color:#333;font-size:20px;font-weight:bold;margin:4px 0;'>{round(PAR_selected, 2)}</p></div>""",
+                        unsafe_allow_html=True)
+                    k3.markdown(f"""<div style='background:#d4edda;padding:12px;border-radius:8px;border-left:4px solid #28a745;'>
+                        <p style='color:#666;font-size:11px;margin:0;'>Verschil</p>
+                        <p style='color:#28a745;font-size:20px;font-weight:bold;margin:4px 0;'>{round(PAR_base - PAR_selected, 2)}</p></div>""",
+                        unsafe_allow_html=True)
+                else:
+                    PAR_base = (df_output["MSR totaal_base profile [kW]"].max()
+                                / df_output["MSR totaal_base profile [kW]"].mean())
+                    k1, k2 = st.columns(2)
+                    k1.markdown(f"""<div style='background:#fff3cd;padding:14px;border-radius:8px;border-left:4px solid #ffc107;'>
+                        <p style='color:#666;font-size:13px;margin:0;'>Piekvermogen (on-demand)</p>
+                        <p style='color:#333;font-size:26px;font-weight:bold;margin:4px 0;'>{int(original_peak):,} kW</p></div>""",
+                        unsafe_allow_html=True)
+                    k2.markdown(f"""<div style='background:#d1ecf1;padding:14px;border-radius:8px;border-left:4px solid #17a2b8;'>
+                        <p style='color:#666;font-size:13px;margin:0;'>Peak-to-Average Ratio</p>
+                        <p style='color:#333;font-size:26px;font-weight:bold;margin:4px 0;'>{round(PAR_base, 2)}</p></div>""",
+                        unsafe_allow_html=True)
+
+                # ---- Batterij KPI's (alleen zichtbaar als batterij aan staat) ----
+                if battery_enabled and df_with_battery is not None:
+                    st.markdown("---")
+                    st.markdown("**🔋 Batterij KPI's**")
+
+                    bat_peak = df_with_battery["MSR totaal met batterij [kW]"].max()
+                    bat_peak_reduction = original_peak - bat_peak
+
+                    # Jaarlijkse cycli: totale ontladen energie / capaciteit
+                    discharged_kwh = (
+                        df_with_battery.loc[
+                            df_with_battery["Batterij vermogen [kW]"] < 0,
+                            "Batterij vermogen [kW]",
+                        ].abs().sum() * 0.25  # × DT (15 min → uur)
+                    )
+                    annual_cycles = discharged_kwh / battery_kwh_val
+
+                    # Benutting: gemiddeld absoluut batterijvermogen vs. max vermogen
+                    max_bat_power = 0.25 * battery_kwh_val
+                    utilisation_pct = (
+                        df_with_battery["Batterij vermogen [kW]"].abs().mean() / max_bat_power * 100
+                        if max_bat_power > 0 else 0
+                    )
+
+                    kb1, kb2, kb3 = st.columns(3)
+                    kb1.markdown(
+                        f"""<div style='background:#d4edda;padding:12px;border-radius:8px;border-left:4px solid #28a745;'>
+                        <p style='color:#666;font-size:11px;margin:0;'>Nieuwe piekbelasting</p>
+                        <p style='color:#28a745;font-size:20px;font-weight:bold;margin:4px 0;'>{int(bat_peak):,} kW</p></div>""",
+                        unsafe_allow_html=True,
+                    )
+                    kb2.markdown(
+                        f"""<div style='background:#d1ecf1;padding:12px;border-radius:8px;border-left:4px solid #17a2b8;'>
+                        <p style='color:#666;font-size:11px;margin:0;'>Piekvermindering batterij</p>
+                        <p style='color:#17a2b8;font-size:20px;font-weight:bold;margin:4px 0;'>{int(bat_peak_reduction):,} kW</p></div>""",
+                        unsafe_allow_html=True,
+                    )
+                    kb3.markdown(
+                        f"""<div style='background:#f0f2f6;padding:12px;border-radius:8px;border-left:4px solid #6c757d;'>
+                        <p style='color:#666;font-size:11px;margin:0;'>Cycli/jaar · Benutting</p>
+                        <p style='color:#333;font-size:20px;font-weight:bold;margin:4px 0;'>{annual_cycles:.1f} · {utilisation_pct:.0f}%</p></div>""",
+                        unsafe_allow_html=True,
+                    )
 
 
-# --- Hoofd-layout: drie visuele kolommen ---
-col_map, col_right = st.columns([1, 2.4], gap="medium")
+# --- Hoofd-layout: kaart links, analyse rechts (intern gesplitst in 2 kolommen) ---
+col_map, col_right = st.columns([1, 2.5], gap="medium")
 
 with col_map:
     with st.container(border=True):

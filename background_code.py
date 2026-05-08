@@ -434,5 +434,151 @@ class BackgroundCode:
         )
 
         return test_output
+
+    def battery_optimizer(
+        self,
+        df: pd.DataFrame,
+        strategy: str,
+        battery_kwh: float = 0.0,
+        price_df: pd.DataFrame = None,
+        peak_percentile: float = 85.0,
+        soc_init_fraction: float = 0.5,
+    ) -> pd.DataFrame:
+        """Simulate a battery on the MSR energy profile with one of three strategies.
+
+        Parameters
+        ----------
+        df : DataFrame
+            Output of profile_creator / update_charge_strat.
+            Must contain 'DATUM_TIJDSTIP_2024' and 'MSR totaal [kW]'.
+            Solar generation is negative in 'Zonnepanelen [kW]'.
+        strategy : str
+            'self_consumption'   – absorb excess solar, discharge to cover imports.
+            'price_optimization' – charge cheap intervals, discharge expensive ones.
+            'peak_reduction'     – shave peaks above peak_percentile, charge in valleys.
+        battery_kwh : float
+            Usable battery capacity in kWh (50–1000). C-rate fixed at 0.25.
+        price_df : DataFrame, optional
+            Required for 'price_optimization'. Columns:
+              'DATUM_TIJDSTIP_2024'  – matching timestamps (15-min)
+              'price_eur_per_kwh'    – electricity price per interval.
+        peak_percentile : float
+            Load percentile used as the peak shaving target (default 85).
+        soc_init_fraction : float
+            Starting SoC as fraction of battery_kwh (default 0.5).
+
+        Returns
+        -------
+        DataFrame (copy of df) with added columns:
+            'Batterij vermogen [kW]'       positive = charging, negative = discharging
+            'Batterij SoC [kWh]'           state of charge over time
+            'MSR totaal met batterij [kW]' net grid load after battery interaction
+        """
+        # --- Constants ---
+        C_RATE = 0.25
+        ETA_CHARGE = 0.96       # charging efficiency
+        ETA_DISCHARGE = 0.96    # discharging efficiency
+        DT = 0.25               # 15-minute interval in hours
+
+        battery_kwh = float(np.clip(battery_kwh, 50, 1000))
+        max_power = C_RATE * battery_kwh          # kW  (e.g. 200 kWh → 50 kW)
+        soc_min = battery_kwh * 0.10
+        soc_max = battery_kwh * 0.90
+
+        df = df.copy().sort_values("DATUM_TIJDSTIP_2024").reset_index(drop=True)
+        load = df["MSR totaal [kW]"].values.astype(float)
+
+        # --- Pre-process price signal ---
+        prices = np.zeros(len(df))
+        daily_mean_prices = np.zeros(len(df))
+        if strategy == "price_optimization":
+            if price_df is None:
+                raise ValueError("price_df is required for strategy='price_optimization'.")
+            price_copy = price_df.copy()
+            price_copy["DATUM_TIJDSTIP_2024"] = pd.to_datetime(price_copy["DATUM_TIJDSTIP_2024"])
+            merged = df.merge(
+                price_copy[["DATUM_TIJDSTIP_2024", "price_eur_per_kwh"]],
+                on="DATUM_TIJDSTIP_2024",
+                how="left",
+            )
+            prices = merged["price_eur_per_kwh"].fillna(merged["price_eur_per_kwh"].mean()).values
+            # Daily mean price per interval — O(n), avoids inner loop
+            dates = pd.to_datetime(df["DATUM_TIJDSTIP_2024"]).dt.date
+            daily_mean_prices = (
+                pd.Series(prices, index=df.index)
+                .groupby(dates)
+                .transform("mean")
+                .values
+            )
+
+        # --- Peak threshold for peak_reduction ---
+        positive_load = load[load > 0]
+        peak_threshold = (
+            float(np.percentile(positive_load, peak_percentile))
+            if strategy == "peak_reduction" and len(positive_load) > 0
+            else 0.0
+        )
+        # Charge only when load is in the bottom 30% — keeps battery ready for peaks
+        charge_threshold = (
+            float(np.percentile(positive_load, 30))
+            if strategy == "peak_reduction" and len(positive_load) > 0
+            else 0.0
+        )
+
+        # --- Simulation loop ---
+        soc = float(np.clip(battery_kwh * soc_init_fraction, soc_min, soc_max))
+        bat_power = np.zeros(len(df))
+        soc_trace = np.zeros(len(df))
+
+        for i in range(len(df)):
+            p = 0.0  # desired power (kW): positive = charge, negative = discharge
+
+            if strategy == "self_consumption":
+                # Charge when net load is negative (solar export); discharge when importing
+                p = -load[i]
+
+            elif strategy == "price_optimization":
+                if prices[i] < daily_mean_prices[i]:
+                    p = max_power       # cheap slot → charge
+                elif prices[i] > daily_mean_prices[i]:
+                    p = -max_power      # expensive slot → discharge
+
+            elif strategy == "peak_reduction":
+                if load[i] > peak_threshold:
+                    # Discharge: push load down to the target level
+                    p = -(load[i] - peak_threshold)
+                elif load[i] <= charge_threshold:
+                    # Charge only during genuinely low-demand periods (bottom 30%)
+                    # Cap so that battery charging never pushes modified load above peak_threshold
+                    p = min(max_power, max(0.0, peak_threshold - load[i]))
+                else:
+                    # Neutral during moderate load — preserve charge for upcoming peaks
+                    p = 0.0
+
+            # Clip to max charge/discharge power
+            p = float(np.clip(p, -max_power, max_power))
+
+            # Apply SoC constraints and recalculate actual power
+            if p > 0:  # Charging: energy stored = p * DT * ETA_CHARGE
+                max_chargeable = (soc_max - soc) / (DT * ETA_CHARGE)
+                p = max(0.0, min(p, max_chargeable))
+                soc += p * DT * ETA_CHARGE
+            elif p < 0:  # Discharging: energy drawn from battery = |p| * DT / ETA_DISCHARGE
+                max_dischargeable = (soc - soc_min) * ETA_DISCHARGE / DT
+                p = min(0.0, max(p, -max_dischargeable))
+                soc += p * DT / ETA_DISCHARGE  # p is negative, so soc decreases
+
+            soc = float(np.clip(soc, soc_min, soc_max))
+            bat_power[i] = p
+            soc_trace[i] = soc
+
+        df["Batterij vermogen [kW]"] = bat_power
+        df["Batterij SoC [kWh]"] = soc_trace
+        # Positive battery power = charging = extra load on MSR; negative = discharging = less load
+        df["MSR totaal met batterij [kW]"] = load + bat_power
+
+        return df
+
+
 if __name__ == "__main__":
     loaded = load_Gsheets()
