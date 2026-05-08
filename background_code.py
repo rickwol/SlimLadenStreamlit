@@ -265,7 +265,8 @@ class BackgroundCode:
                 "Woningen totaal [kW]",
                 "Zonnepanelen [kW]"
             ],
-            max_base_profile=None
+            max_base_profile=None,
+            nbl_limit=None
         ):
         if df is None or df.empty:
             placeholder.write("No data to plot.")
@@ -349,13 +350,32 @@ class BackgroundCode:
             )
             
             # Combine all layers
-            chart = (chart + rule + text).properties(
-                padding={"bottom": 40}
+            chart = chart + rule + text
+
+        if nbl_limit is not None:
+            nbl_rule = alt.Chart(pd.DataFrame({'y': [nbl_limit]})).mark_rule(
+                color='orange',
+                strokeWidth=2.5
+            ).encode(y='y:Q')
+
+            nbl_text = alt.Chart(pd.DataFrame({
+                'y': [nbl_limit],
+                'label': [f'Fysieke grens (NBL): {int(nbl_limit)} kW']
+            })).mark_text(
+                align='right',
+                dx=-5,
+                dy=-5,
+                color='orange',
+                fontSize=11,
+                fontWeight='bold'
+            ).encode(
+                x=alt.value(0),
+                y='y:Q',
+                text='label:N'
             )
-        else:
-            chart = chart.properties(
-                padding={"bottom": 40}
-            )
+            chart = chart + nbl_rule + nbl_text
+
+        chart = chart.properties(height=280, padding={"top": 10, "bottom": 0, "left": 5, "right": 5})
 
         # Render chart
         placeholder.altair_chart(chart, use_container_width=True)
