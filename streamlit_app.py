@@ -108,7 +108,7 @@ def get_address_from_coords(lat, lon):
 @st.cache_data
 def geocode_address(address):
     try:
-        geolocator = Nominatim(user_agent="msr_app")
+        geolocator = Nominatim(user_agent="SlimLaden-MSR-App/1.0 (m.j.f.jenks@hva.nl)")
         location = geolocator.geocode(address + ", Nederland", timeout=10)
         if location:
             return (location.latitude, location.longitude)
