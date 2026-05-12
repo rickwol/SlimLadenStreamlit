@@ -470,18 +470,10 @@ def render_analysis_panel():
 
         if isinstance(default_start, pd.Timestamp):
             default_start = default_start.date()
-        default_start = min(max(default_start, min_date), max_date)
+        max_start_date = max_date - timedelta(days=1)
+        default_start = min(max(default_start, min_date), max_start_date)
 
         rd1, rd2, rd3, rd4 = st.columns([1.2, 1.2, 1, 1])
-        with rd1:
-            start_date = st.date_input("Startdatum", default_start, min_value=min_date, max_value=max_date)
-        with rd2:
-            end_date = st.date_input(
-                "Einddatum",
-                start_date + timedelta(days=1),
-                min_value=start_date + timedelta(days=1),
-                max_value=max_date,
-            )
         with rd3:
             st.write("")
             if st.button("📈 Hoogste piek", use_container_width=True):
@@ -489,6 +481,7 @@ def render_analysis_panel():
                     df_output["MSR totaal [kW]"].idxmax(), "DATUM_TIJDSTIP_2024"
                 ]
                 st.session_state.min_max = "max"
+                st.rerun()
         with rd4:
             st.write("")
             if st.button("📉 Laagste piek", use_container_width=True):
@@ -496,6 +489,16 @@ def render_analysis_panel():
                     df_output["MSR totaal [kW]"].idxmin(), "DATUM_TIJDSTIP_2024"
                 ]
                 st.session_state.min_max = "min"
+                st.rerun()
+        with rd1:
+            start_date = st.date_input("Startdatum", default_start, min_value=min_date, max_value=max_start_date)
+        with rd2:
+            end_date = st.date_input(
+                "Einddatum",
+                start_date + timedelta(days=1),
+                min_value=start_date + timedelta(days=1),
+                max_value=max_date,
+            )
 
         date_range = (end_date - start_date).days
         if date_range <= 10:
